@@ -1,4 +1,4 @@
-const TELEMETRY_URL = 'http://172.30.1.50:25555/api/ets2/telemetry';
+const TELEMETRY_URL = 'http://localhost:25555/api/ets2/telemetry';
 
 // ==========================================
 // 1. 드래그 및 이동 로직 (Drag & Drop Logic)
@@ -22,10 +22,10 @@ function makeDraggable(element) {
         const rect = element.getBoundingClientRect();
         offsetX = e.clientX - rect.left;
         offsetY = e.clientY - rect.top;
-        
+
         // 클릭 시 해당 위젯을 가장 앞으로 가져옴
         document.querySelectorAll('.widget').forEach(w => w.style.zIndex = '10');
-        element.style.zIndex = '100'; 
+        element.style.zIndex = '100';
     });
 
     // 화면 위에서 마우스를 뗄 때
@@ -43,7 +43,7 @@ function makeDraggable(element) {
     // 드래그하여 움직이는 중
     document.addEventListener('mousemove', (e) => {
         if (!isDragging) return;
-        
+
         let newX = e.clientX - offsetX;
         let newY = e.clientY - offsetY;
 
@@ -153,13 +153,13 @@ async function fetchTelemetry() {
         if (totalGameMins > 0) {
             const irlMinutes = Math.floor(totalGameMins / 19);
             const arrivalDate = new Date(Date.now() + irlMinutes * 60000);
-            
+
             let irlHours = arrivalDate.getHours();
             const irlMins = arrivalDate.getMinutes();
             const ampm = irlHours >= 12 ? '오후' : '오전';
             irlHours = irlHours % 12 || 12;
             const formattedTime = `${irlHours}:${irlMins.toString().padStart(2, '0')}`;
-            
+
             elNavEta.innerText = `${irlMinutes}분 - ${formattedTime} ${ampm}`;
         } else {
             elNavEta.innerText = `도착 지점 근처`;

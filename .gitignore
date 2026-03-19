@@ -1,6 +1,7 @@
 node_modules/
 config.json
 *.png
+!preview.png
 *.jpg
 *.log
 숨김실행.vbs

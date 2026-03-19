@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Truck Telemetry Overlay</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="overlay-container">
+        <!-- 위젯 1: 트럭 및 트레일러 -->
+        <div class="widget" id="widget-truck">
+            <div class="widget-header">당신의 트럭 및 트레일러</div>
+            <div class="widget-body">
+                <div class="data-group">
+                    <div class="data-row">
+                        <span class="col"><i class="fa-solid fa-wrench"></i> <span id="truck-damage">0%</span></span>
+                        <span class="col"><i class="fa-solid fa-gear"></i> <span id="truck-gear">N</span></span>
+                    </div>
+                    <div class="data-row">
+                        <span class="col"><i class="fa-solid fa-gas-pump"></i> <span id="truck-fuel">0 l / 0 l</span></span>
+                        <span class="col"><i class="fa-solid fa-arrow-right-to-bracket"></i> <span id="truck-range">0 km</span></span>
+                    </div>
+                    <div class="data-row">
+                        <span class="col"><i class="fa-solid fa-truck-trailer"></i> <span id="trailer-damage">0%</span></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 위젯 2: 배송물 -->
+        <div class="widget" id="widget-job">
+            <div class="widget-header">현재 배송물</div>
+            <div class="widget-body">
+                <div class="data-group">
+                    <div class="data-row">
+                        <span class="full-row"><i class="fa-solid fa-angles-left"></i> <span id="job-source">-</span></span>
+                    </div>
+                    <div class="data-row">
+                        <span class="full-row"><i class="fa-solid fa-angles-right"></i> <span id="job-dest">-</span></span>
+                    </div>
+                    <div class="data-row">
+                        <span class="col"><i class="fa-solid fa-truck-fast"></i> <span id="cargo-info">- (0 t)</span></span>
+                        <span class="col"><i class="fa-solid fa-heart-crack"></i> <span id="cargo-damage">0%</span></span>
+                    </div>
+                    <div class="data-row">
+                        <span class="full-row"><i class="fa-solid fa-hand-holding-dollar"></i> <span id="job-income">0 EUR</span></span>
+                    </div>
+                    <div class="data-row">
+                        <span class="full-row"><i class="fa-solid fa-gas-pump"></i> <span id="fuel-consumption">0.0 l/100km</span></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 위젯 3: 네비게이션 -->
+        <div class="widget" id="widget-nav">
+            <div class="widget-header">네비게이션</div>
+            <div class="widget-body">
+                <div class="data-group">
+                    <div class="data-row">
+                        <span class="full-row"><i class="fa-solid fa-route"></i> <span id="nav-distance">0 km</span></span>
+                    </div>
+                    <div class="data-row">
+                        <span class="full-row"><i class="fa-solid fa-hourglass-half"></i> <span id="nav-eta">-분 - 0:00 오후</span></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="app.js"></script>
+</body>
+</html>

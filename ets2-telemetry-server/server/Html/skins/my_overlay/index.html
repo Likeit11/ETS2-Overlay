@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Truck Telemetry Overlay</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="overlay-container">
+        <!-- 위젯 1: 트럭 및 트레일러 -->
+        <div class="widget" id="widget-truck">
+            <div class="widget-header">당신의 트럭 및 트레일러</div>
+            <div class="widget-body">
+                <div class="data-group">
+                    <div class="data-row">
+                        <span class="col"><i class="fa-solid fa-wrench"></i> <span id="truck-damage">0%</span></span>
+                        <span class="col"><i class="fa-solid fa-gear"></i> <span id="truck-gear">N</span></span>
+                    </div>
+                    <div class="data-row">
+                        <span class="col"><i class="fa-solid fa-gas-pump"></i> <span id="truck-fuel">0 l / 0 l</span></span>
+                        <span class="col" title="주유 후 예상 주행 가능 거리">
+                            <i class="fa-solid fa-arrow-right-to-bracket"></i>
+                            <span id="truck-range">0 km</span>
+                        </span>
+                    </div>
+                    <div class="data-row">
+                        <span class="col" title="트레일러 파손도">
+                            <svg viewBox="0 0 24 24" width="20" height="20" style="margin-left:-2px;">
+                               <defs>
+                                  <mask id="bolt-mask">
+                                     <!-- 기본 판 (전체 표시) -->
+                                     <rect x="0" y="0" width="24" height="24" fill="white" />
+                                     
+                                     <!-- 정중앙 거대한 반전(파인) 번개 마크 -->
+                                     <g transform="translate(12, 9) scale(-1.4, 1.4) translate(-12, -9)">
+                                        <path d="M12.5 5 v3.5 h2L11 13 v-3.5 H9 L12.5 5z" fill="black" />
+                                     </g>
+                                  </mask>
+                               </defs>
+                               
+                               <g fill="#a0a0a0" mask="url(#bolt-mask)">
+                                   <!-- 컨테이너 박스 외형 -->
+                                   <rect x="1" y="4" width="22" height="10" rx="0.5" />
+                                   <!-- 하부 섀시 프레임 (슬랜트 구조) -->
+                                   <path d="M1 14 h14 l1.5 2.5 h6.5 v1.5 H1 z" />
+                                   <!-- 2축 타이어 -->
+                                   <circle cx="16" cy="19" r="2.2" />
+                                   <circle cx="21" cy="19" r="2.2" />
+                                   <!-- 랜딩 기어 (앞쪽 받침대) -->
+                                   <rect x="4" y="14" width="1.5" height="4.5" rx="0.5" />
+                               </g>
+                            </svg>
+                            <span id="trailer-damage">0%</span>
+                        </span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 위젯 2: 배송물 -->
+        <div class="widget" id="widget-job">
+            <div class="widget-header">현재 배송물</div>
+            <div class="widget-body">
+                <div class="data-group">
+                    <div class="data-row">
+                        <span class="full-row"><i class="fa-solid fa-angles-left"></i> <span id="job-source">-</span></span>
+                    </div>
+                    <div class="data-row">
+                        <span class="full-row"><i class="fa-solid fa-angles-right"></i> <span id="job-dest">-</span></span>
+                    </div>
+                    <div class="data-row">
+                        <span class="col"><i class="fa-solid fa-truck-fast"></i> <span id="cargo-info">- (0 t)</span></span>
+                        <span class="col"><i class="fa-solid fa-heart-crack"></i> <span id="cargo-damage">0%</span></span>
+                    </div>
+                    <div class="data-row">
+                        <span class="full-row"><i class="fa-solid fa-hand-holding-dollar"></i> <span id="job-income">0 EUR</span></span>
+                    </div>
+                    <div class="data-row">
+                        <span class="full-row"><i class="fa-solid fa-gas-pump"></i> <span id="fuel-consumption">0.0 l/100km</span></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 위젯 3: 네비게이션 -->
+        <div class="widget" id="widget-nav">
+            <div class="widget-header">네비게이션</div>
+            <div class="widget-body">
+                <div class="data-group">
+                    <div class="data-row">
+                        <span class="full-row"><i class="fa-solid fa-route"></i> <span id="nav-distance">0 km</span></span>
+                    </div>
+                    <div class="data-row">
+                        <span class="full-row"><i class="fa-solid fa-hourglass-half"></i> <span id="nav-eta">-분 - 0:00 오후</span></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 키맵핑 설정창 모달 -->
+    <div id="settings-modal" class="modal" style="display:none;">
+        <div class="modal-content">
+            <div class="modal-header">기본 설정 및 단축키 맵핑</div>
+            <div class="modal-body">
+                <div class="setting-item">
+                    <label>클릭잠금(관통) ↔ 표창 이동 모드</label>
+                    <input type="text" id="key-mode" placeholder="Insert">
+                </div>
+                <div class="setting-item">
+                    <label>화면 자체를 끄기 / 켜기</label>
+                    <input type="text" id="key-toggle" placeholder="PageDown">
+                </div>
+                <div class="setting-item">
+                    <label>환경설정 창 띄우기</label>
+                    <input type="text" id="key-settings" placeholder="PageUp">
+                </div>
+                <hr style="border: 0; border-top: 1px solid rgba(255,255,255,0.1); margin: 15px 0;">
+                <div class="setting-item">
+                    <label>오버레이 뒷배경 투명도(%)</label>
+                    <input type="range" id="opt-opacity" min="0" max="100" value="75">
+                </div>
+                <div class="setting-item">
+                    <label><input type="checkbox" id="opt-truck"> 트럭 / 트레일러 위젯 표시</label>
+                </div>
+                <div class="setting-item">
+                    <label><input type="checkbox" id="opt-job"> 배송물 정보 위젯 표시</label>
+                </div>
+                <div class="setting-item">
+                    <label><input type="checkbox" id="opt-nav"> 네비게이션 위젯 표시</label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" id="btn-save">저장</button>
+                <button class="btn btn-cancel" id="btn-cancel">닫기</button>
+            </div>
+            <button class="btn btn-quit" id="btn-quit" style="width: 100%; margin-top: 10px; background: #dc3545;">오버레이 프로그램 완전 종료</button>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

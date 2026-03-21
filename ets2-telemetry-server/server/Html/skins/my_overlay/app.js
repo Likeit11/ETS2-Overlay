@@ -213,27 +213,57 @@ async function fetchTelemetry() {
         const distKm = Math.round(navigation.estimatedDistance / 1000);
         elNavDistance.innerText = `${distKm} km`;
 
-        // ETS2의 game.timeScale은 도심/주유소에서 3으로 떨어짐
-        // 이 때 남은 전체 시간을 3으로 나누면 현실 도착 예상 시간이 무려 6배 이상 폭증하는 버그가 발생함
-        // 따라서 계산용 배율은 최소 15(유럽 19, 영국 15)로 고정하여 안정적인 현실 시간 산출
+        // [네비게이션 맵 데이터 역산 + 실시간 속도 하이브리드 결합 방식]
         let safeScale = game.timeScale || 19;
-        if (safeScale < 15) safeScale = 19; 
+        let isAts = game.gameName === 'ATS';
+        let highwayScale = isAts ? 20 : 19;
+        let cityScale = 3;
 
         if (distKm > 1) {
-            // [속도 계산 방식: 하이브리드(Mode 3) 적용]
-            // 최근 3분 실시간 평균 속도 반영 (최소 62 보장)
-            let avgKmh = 62;
-            if (speedHistory.length > 0) {
-                const avg = speedHistory.reduce((a, b) => a + b, 0) / speedHistory.length;
-                avgKmh = Math.max(62, avg);
-            }
-            // 평균 속도보다 지금 과속 중이라면 현재 속도를 기준
-            let chosenAvgSpeed = Math.max(avgKmh, truck.speed > 0 ? truck.speed : 0);
-            
-            // 만약 현재 정차(0km/h) 중이라면 무한대가 되지 않게 62km/h 보정
-            chosenAvgSpeed = Math.max(62, chosenAvgSpeed);
+            let irlMinutes = 0;
+            let currentSpeedKmh = Math.abs(truck.speed > 0 ? truck.speed : 0);
 
-            const irlMinutes = Math.floor((distKm / chosenAvgSpeed) * 60 / safeScale);
+            if (navigation.estimatedTime && game.time) {
+                let tGameEnd = new Date(navigation.estimatedTime).getTime();
+                let tGameNow = new Date(game.time).getTime();
+                
+                if (!isNaN(tGameEnd) && !isNaN(tGameNow) && tGameEnd > tGameNow) {
+                    let tGameHours = (tGameEnd - tGameNow) / 3600000;
+                    
+                    let D_c = (70 * tGameHours) - distKm;
+                    if (D_c < 0) D_c = 0;
+                    if (D_c > distKm) D_c = distKm;
+                    let D_h = distKm - D_c;
+
+                    let realHoursCity = (D_c / 35) / cityScale;
+                    let realHoursHighway = (D_h / 70) / highwayScale;
+                    let theoreticalIrlMinutes = (realHoursCity + realHoursHighway) * 60;
+                    
+                    let avgKmh = 62; 
+                    if (speedHistory.length > 0) {
+                        const avg = speedHistory.reduce((a, b) => a + b, 0) / speedHistory.length;
+                        avgKmh = Math.max(30, avg); 
+                    }
+                    let chosenAvgSpeed = Math.max(avgKmh, currentSpeedKmh);
+                    chosenAvgSpeed = Math.max(40, chosenAvgSpeed); 
+
+                    let dynamicSpeedRatio = 62 / chosenAvgSpeed;
+                    irlMinutes = Math.floor(theoreticalIrlMinutes * dynamicSpeedRatio);
+                }
+            }
+            
+            if (irlMinutes === 0) {
+                let avgKmh = 62;
+                if (speedHistory.length > 0) {
+                    const avg = speedHistory.reduce((a, b) => a + b, 0) / speedHistory.length;
+                    avgKmh = Math.max(62, avg);
+                }
+                let chosenAvgSpeed = Math.max(avgKmh, currentSpeedKmh);
+                chosenAvgSpeed = Math.max(62, chosenAvgSpeed);
+                if (safeScale < 15) safeScale = 19;
+                irlMinutes = Math.floor((distKm / chosenAvgSpeed) * 60 / safeScale);
+            }
+
             const arrivalDate = new Date(Date.now() + irlMinutes * 60000);
             
             let irlHours = arrivalDate.getHours();

@@ -50,15 +50,37 @@ function registerShortcuts() {
         });
     } catch(e) { console.error("Invalid hotkey: toggleOverlay"); }
 
-    // 설정 창 띄우기
+    // 설정 창 띄우기 토글
     try {
         globalShortcut.register(config.openSettings, () => {
-            isLocked = false; // 설정하려면 클릭이 되어야 하므로 풀기
-            win.setIgnoreMouseEvents(false, { forward: true });
-            isVisible = true;
-            win.show();
-            win.focus();
-            win.webContents.executeJavaScript(`(() => { if(typeof openSettingsModal === 'function') openSettingsModal(); })()`).catch(console.error);
+            if(!isVisible) return;
+            win.webContents.executeJavaScript(`(() => {
+                const m = document.getElementById('settings-modal');
+                if (m.style.display === 'flex') {
+                    if(typeof closeSettingsModal === 'function') closeSettingsModal();
+                    return true; // wasOpen
+                } else {
+                    if(typeof openSettingsModal === 'function') openSettingsModal();
+                    return false; // was NOT open
+                }
+            })()`).then((wasOpen) => {
+                if (wasOpen) {
+                    // 창 닫히고 게임에 포커스 (클릭 투과 모드)
+                    isLocked = true;
+                    if(win) {
+                        win.setIgnoreMouseEvents(true, { forward: true });
+                        win.blur();
+                    }
+                } else {
+                    // 창 열리고 편집 모드 가능
+                    isLocked = false;
+                    if(win) {
+                        win.setIgnoreMouseEvents(false, { forward: true });
+                        win.show();
+                        win.focus();
+                    }
+                }
+            }).catch(console.error);
         });
     } catch(e) { console.error("Invalid hotkey: openSettings"); }
 }
@@ -110,6 +132,17 @@ ipcMain.on('update-shortcuts', (event, newConfig) => {
     fs.writeFileSync(configFile, JSON.stringify(config, null, 2));
     registerShortcuts();
 });
+
+ipcMain.on('set-locked', (event, state) => {
+    isLocked = state;
+    if(win) {
+        win.setIgnoreMouseEvents(state, { forward: true });
+        if(state) win.blur(); else win.focus();
+    }
+});
+
+ipcMain.on('suspend-shortcuts', () => globalShortcut.unregisterAll());
+ipcMain.on('resume-shortcuts', () => registerShortcuts());
 
 ipcMain.handle('get-shortcuts', () => { return config; });
 

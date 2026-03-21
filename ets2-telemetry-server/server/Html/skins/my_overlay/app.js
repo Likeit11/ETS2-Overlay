@@ -7,12 +7,7 @@ function makeDraggable(element) {
     const header = element.querySelector('.widget-header');
     let isDragging = false;
     let offsetX, offsetY;
-    const savedPos = localStorage.getItem(`pos_${element.id}`);
-    if (savedPos) {
-        const { left, top } = JSON.parse(savedPos);
-        element.style.left = left;
-        element.style.top = top;
-    }
+    
     header.addEventListener('mousedown', (e) => {
         isDragging = true;
         const rect = element.getBoundingClientRect();
@@ -35,9 +30,32 @@ function makeDraggable(element) {
         element.style.top = `${newY}px`;
     });
 }
+
 const defaultPositions = { 'widget-truck': { left: '20px', top: '20px' }, 'widget-job': { left: '20px', top: '160px' }, 'widget-nav': { left: '20px', top: '340px' } };
 document.querySelectorAll('.widget').forEach(widget => {
-    if (!localStorage.getItem(`pos_${widget.id}`)) { widget.style.left = defaultPositions[widget.id].left; widget.style.top = defaultPositions[widget.id].top; }
+    let savedPos = localStorage.getItem(`pos_${widget.id}`);
+    let applied = false;
+    
+    if (savedPos) {
+        try {
+            const { left, top } = JSON.parse(savedPos);
+            let x = parseInt(left, 10);
+            let y = parseInt(top, 10);
+            // 윈도우 크기를 벗어났거나 숫자가 아니면 초기화
+            if (!isNaN(x) && !isNaN(y) && x >= 0 && x <= (window.innerWidth || 1920) && y >= 0 && y <= (window.innerHeight || 1080)) {
+                widget.style.left = left;
+                widget.style.top = top;
+                applied = true;
+            }
+        } catch(e) {}
+    }
+    
+    if (!applied) {
+        widget.style.left = defaultPositions[widget.id].left; 
+        widget.style.top = defaultPositions[widget.id].top; 
+        localStorage.removeItem(`pos_${widget.id}`); // 잘못된 값 삭제
+    }
+    
     makeDraggable(widget);
 });
 
@@ -58,6 +76,43 @@ window.openSettingsModal = async function() {
     document.getElementById('settings-modal').style.display = 'flex';
 }
 
+window.closeSettingsModal = function() {
+    document.getElementById('settings-modal').style.display = 'none';
+    if(window.electronAPI) window.electronAPI.setLocked(true);
+}
+
+// 자동 키 입력 등록을 위한 로직
+document.querySelectorAll('.setting-item input[type="text"]').forEach(input => {
+    input.addEventListener('focus', () => {
+        if(window.electronAPI) window.electronAPI.suspendShortcuts();
+        input.dataset.oldVal = input.value; // 기존 값 백업
+        input.value = "";
+        input.placeholder = "새 키를 입력... (취소는 ESC)";
+    });
+    input.addEventListener('blur', () => {
+        // 포커스 해제 시 값이 비어있다면 취소된 것으로 간주하고 복구
+        if(input.value.trim() === "") {
+            input.value = input.dataset.oldVal || "";
+        }
+        if(window.electronAPI) window.electronAPI.resumeShortcuts();
+    });
+    input.addEventListener('keydown', (e) => {
+        e.preventDefault();
+        let key = e.key;
+        if(key.length === 1 && key >= 'a' && key <= 'z') key = key.toUpperCase();
+        if(key === ' ') key = 'Space';
+        
+        if(key === 'Escape') { 
+            input.value = input.dataset.oldVal; // 초기화(원래 값 복원)
+            input.blur(); 
+            return; 
+        }
+        
+        input.value = key;
+        input.blur();
+    });
+});
+
 document.getElementById('btn-save').onclick = () => {
     if(window.electronAPI) {
         const config = {
@@ -72,10 +127,10 @@ document.getElementById('btn-save').onclick = () => {
         window.electronAPI.updateShortcuts(config);
         applyVisualConfig(config);
     }
-    document.getElementById('settings-modal').style.display = 'none';
+    window.closeSettingsModal();
 }
 
-document.getElementById('btn-cancel').onclick = () => { document.getElementById('settings-modal').style.display = 'none'; }
+document.getElementById('btn-cancel').onclick = () => { window.closeSettingsModal(); }
 
 document.getElementById('btn-quit').onclick = () => {
     if(window.electronAPI) {

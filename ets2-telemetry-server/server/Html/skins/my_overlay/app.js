@@ -145,7 +145,10 @@ async function fetchTelemetry() {
             let irlHours = arrivalDate.getHours();
             const ampm = irlHours >= 12 ? '오후' : '오전';
             irlHours = irlHours % 12 || 12;
-            elNavEta.innerText = `${irlMinutes}분 - ${irlHours}:${arrivalDate.getMinutes().toString().padStart(2, '0')} ${ampm}`;
+            const h = Math.floor(irlMinutes / 60);
+            const m = irlMinutes % 60;
+            const timeStr = h > 0 ? `${h}시간 ${m}분` : `${m}분`;
+            elNavEta.innerText = `${timeStr} - ${irlHours}:${arrivalDate.getMinutes().toString().padStart(2, '0')} ${ampm}`;
         } else { elNavEta.innerText = `도착 지점 근처`; }
 
     } catch (e) {

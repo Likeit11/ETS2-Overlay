@@ -134,9 +134,13 @@ async function fetchTelemetry() {
         const distKm = Math.round(navigation.estimatedDistance / 1000);
         elNavDistance.innerText = `${distKm} km`;
 
-        const totalGameMins = (new Date(navigation.estimatedTime).getUTCHours() * 60) + new Date(navigation.estimatedTime).getUTCMinutes();
+        const estTime = new Date(navigation.estimatedTime);
+        const estDays = Math.max(0, estTime.getUTCDate() - 1);
+        const totalGameMins = (estDays * 24 * 60) + (estTime.getUTCHours() * 60) + estTime.getUTCMinutes();
+        const timeScale = game.timeScale || 19;
+
         if (totalGameMins > 0) {
-            const irlMinutes = Math.floor(totalGameMins / 19);
+            const irlMinutes = Math.floor(totalGameMins / timeScale);
             const arrivalDate = new Date(Date.now() + irlMinutes * 60000);
             let irlHours = arrivalDate.getHours();
             const ampm = irlHours >= 12 ? '오후' : '오전';

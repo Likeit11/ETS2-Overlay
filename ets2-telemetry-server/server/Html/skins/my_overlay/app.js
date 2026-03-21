@@ -151,7 +151,25 @@ if (window.electronAPI) { window.electronAPI.getShortcuts().then(applyVisualConf
 // ==========================================
 const elTruckDamage = document.getElementById('truck-damage'), elTruckGear = document.getElementById('truck-gear'), elTruckFuel = document.getElementById('truck-fuel'), elTruckRange = document.getElementById('truck-range'), elTrailerDamage = document.getElementById('trailer-damage');
 const elJobSource = document.getElementById('job-source'), elJobDest = document.getElementById('job-dest'), elCargoInfo = document.getElementById('cargo-info'), elCargoDamage = document.getElementById('cargo-damage'), elJobIncome = document.getElementById('job-income'), elFuelConsumption = document.getElementById('fuel-consumption');
-const elNavDistance = document.getElementById('nav-distance'), elNavEta = document.getElementById('nav-eta');
+const elNavDistance = document.getElementById('nav-distance');
+const elNavEta = document.getElementById('nav-eta');
+const elRealClock = document.getElementById('real-clock');
+
+// 이동 평균 속도 계산을 위한 배열 (0.5초마다 업데이트되므로 3분 = 360개)
+const speedHistory = [];
+const HISTORY_MAX_LEN = 360; 
+
+function updateRealClock() {
+    if (!elRealClock) return;
+    const now = new Date();
+    let h = now.getHours();
+    const ampm = h >= 12 ? '오후' : '오전';
+    h = h % 12 || 12;
+    const m = now.getMinutes().toString().padStart(2, '0');
+    elRealClock.innerText = `${ampm} ${h}:${m}`;
+}
+setInterval(updateRealClock, 1000);
+updateRealClock();
 
 function formatGear(gear) { if (gear > 0) return `D${gear}`; if (gear < 0) return `R${Math.abs(gear)}`; return 'N'; }
 
@@ -163,6 +181,12 @@ async function fetchTelemetry() {
         const { game, truck, trailer, job, navigation } = data;
 
         if (!game.connected) { elNavDistance.innerText = '미연결'; return; }
+
+        // 트럭이 정차해있지 않고 게임이 일시정지가 아닐 경우에만 속도 기록 누적
+        if (!game.paused && truck.speed > 0) {
+            speedHistory.push(truck.speed);
+            if (speedHistory.length > HISTORY_MAX_LEN) speedHistory.shift();
+        }
 
         const maxTruckWear = Math.max(truck.wearEngine, truck.wearTransmission, truck.wearCabin, truck.wearChassis, truck.wearWheels);
         elTruckDamage.innerText = `${Math.round(maxTruckWear * 100)}%`;
@@ -189,22 +213,40 @@ async function fetchTelemetry() {
         const distKm = Math.round(navigation.estimatedDistance / 1000);
         elNavDistance.innerText = `${distKm} km`;
 
-        const estTime = new Date(navigation.estimatedTime);
-        const estDays = Math.max(0, estTime.getUTCDate() - 1);
-        const totalGameMins = (estDays * 24 * 60) + (estTime.getUTCHours() * 60) + estTime.getUTCMinutes();
-        const timeScale = game.timeScale || 19;
+        // ETS2의 game.timeScale은 도심/주유소에서 3으로 떨어짐
+        // 이 때 남은 전체 시간을 3으로 나누면 현실 도착 예상 시간이 무려 6배 이상 폭증하는 버그가 발생함
+        // 따라서 계산용 배율은 최소 15(유럽 19, 영국 15)로 고정하여 안정적인 현실 시간 산출
+        let safeScale = game.timeScale || 19;
+        if (safeScale < 15) safeScale = 19; 
 
-        if (totalGameMins > 0) {
-            const irlMinutes = Math.floor(totalGameMins / timeScale);
+        if (distKm > 1) {
+            // [속도 계산 방식: 하이브리드(Mode 3) 적용]
+            // 최근 3분 실시간 평균 속도 반영 (최소 62 보장)
+            let avgKmh = 62;
+            if (speedHistory.length > 0) {
+                const avg = speedHistory.reduce((a, b) => a + b, 0) / speedHistory.length;
+                avgKmh = Math.max(62, avg);
+            }
+            // 평균 속도보다 지금 과속 중이라면 현재 속도를 기준
+            let chosenAvgSpeed = Math.max(avgKmh, truck.speed > 0 ? truck.speed : 0);
+            
+            // 만약 현재 정차(0km/h) 중이라면 무한대가 되지 않게 62km/h 보정
+            chosenAvgSpeed = Math.max(62, chosenAvgSpeed);
+
+            const irlMinutes = Math.floor((distKm / chosenAvgSpeed) * 60 / safeScale);
             const arrivalDate = new Date(Date.now() + irlMinutes * 60000);
+            
             let irlHours = arrivalDate.getHours();
             const ampm = irlHours >= 12 ? '오후' : '오전';
             irlHours = irlHours % 12 || 12;
             const h = Math.floor(irlMinutes / 60);
             const m = irlMinutes % 60;
             const timeStr = h > 0 ? `${h}시간 ${m}분` : `${m}분`;
+            
             elNavEta.innerText = `${timeStr} - ${irlHours}:${arrivalDate.getMinutes().toString().padStart(2, '0')} ${ampm}`;
-        } else { elNavEta.innerText = `도착 지점 근처`; }
+        } else { 
+            elNavEta.innerText = `도착 지점 근처`; 
+        }
 
     } catch (e) {
         console.error("Telemetry error: ", e);

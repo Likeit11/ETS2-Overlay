@@ -60,7 +60,7 @@ npm install
 
 ### 3. 텔레메트리 서버 설정 (최초 1회)
 
-1. `ets2-telemetry-server/server/Ets2Telemetry.exe`를 **관리자 권한**으로 실행합니다.
+1. `ets2-telemetry-server/server/Ets2Telemetry.exe`를 실행합니다. 만약 제대로 설치가 안될 경우 **관리자 권한**으로 실행하여 설치합니다.
 2. **Install** 버튼을 클릭하여 텔레메트리 플러그인 DLL을 게임 디렉토리에 설치합니다.
 3. 설치가 완료되면 서버를 닫아도 됩니다. (이후에는 배치 파일이 자동 실행합니다.)
 

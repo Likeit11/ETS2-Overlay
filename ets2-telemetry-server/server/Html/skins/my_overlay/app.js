@@ -147,7 +147,7 @@ function applyVisualConfig(config) {
 if (window.electronAPI) { window.electronAPI.getShortcuts().then(applyVisualConfig); }
 
 // ==========================================
-// 3. 텔레메트리 업데이트 로직 
+// 3. 프리미엄 ETA 엔진 (도시 근접도 기반)
 // ==========================================
 const elTruckDamage = document.getElementById('truck-damage'), elTruckGear = document.getElementById('truck-gear'), elTruckFuel = document.getElementById('truck-fuel'), elTruckRange = document.getElementById('truck-range'), elTrailerDamage = document.getElementById('trailer-damage');
 const elJobSource = document.getElementById('job-source'), elJobDest = document.getElementById('job-dest'), elCargoInfo = document.getElementById('cargo-info'), elCargoDamage = document.getElementById('cargo-damage'), elJobIncome = document.getElementById('job-income'), elFuelConsumption = document.getElementById('fuel-consumption');
@@ -155,9 +155,73 @@ const elNavDistance = document.getElementById('nav-distance');
 const elNavEta = document.getElementById('nav-eta');
 const elRealClock = document.getElementById('real-clock');
 
-// 이동 평균 속도 계산을 위한 배열 (0.5초마다 업데이트되므로 3분 = 360개)
+// --- 도시 데이터 (372개 도시 좌표 + 반경) ---
+let cityNodes = null; // [{x, z, radius}, ...]
+fetch('skins/my_overlay/cities_ets2.json')
+    .then(r => r.json())
+    .then(data => { cityNodes = data; console.log(`[Premium ETA] ${data.length}개 도시 데이터 로드 완료`); })
+    .catch(e => console.warn('[Premium ETA] 도시 데이터 로드 실패:', e));
+
+// --- TruckNav-Sim 포팅: 도시 반경 내부인지 판정 ---
+// (algorithm.ts의 getScaleMultiplier와 동일한 로직)
+function getTimeScale(gameX, gameZ) {
+    if (!cityNodes) return 19;
+    for (let i = 0; i < cityNodes.length; i++) {
+        const city = cityNodes[i];
+        const dx = gameX - city.x;
+        const dz = gameZ - city.z;
+        if (dx * dx + dz * dz < city.radius * city.radius) {
+            return 3; // 도심
+        }
+    }
+    return 19; // 고속도로/교외
+}
+
+// --- 게임 시간 파싱: "0001-01-01T03:01:40Z" → 분 단위 ---
+function parseGameMinutes(timeStr) {
+    if (!timeStr) return 0;
+    const d = new Date(timeStr);
+    const base = new Date('0001-01-01T00:00:00Z');
+    return (d.getTime() - base.getTime()) / 60000;
+}
+
+// --- 타이머 소진율 추적 (슬라이딩 윈도우) ---
+const timerHistory = []; // {realMs, gameMin}
+const TIMER_HISTORY_MAX = 120; // 60초 (0.5초×120)
+let lastKnownRate = 19; // 초기값: 고속도로
+
+function updateTimerHistory(gameMinRemaining) {
+    const now = Date.now();
+    timerHistory.push({ realMs: now, gameMin: gameMinRemaining });
+    if (timerHistory.length > TIMER_HISTORY_MAX) timerHistory.shift();
+}
+
+function getCountdownRate() {
+    if (timerHistory.length < 4) return lastKnownRate;
+    
+    // 최근 30초(60 samples)와 비교
+    const lookback = Math.min(timerHistory.length, 60);
+    const oldest = timerHistory[timerHistory.length - lookback];
+    const newest = timerHistory[timerHistory.length - 1];
+    
+    const realMinElapsed = (newest.realMs - oldest.realMs) / 60000;
+    const gameMinConsumed = oldest.gameMin - newest.gameMin;
+    
+    // 게임이 일시정지되었거나 정차 중이면 소진이 없음
+    if (realMinElapsed < 0.05 || gameMinConsumed <= 0) return lastKnownRate;
+    
+    const rate = gameMinConsumed / realMinElapsed;
+    
+    // 합리적 범위 내에서만 갱신 (3~25)
+    if (rate >= 2 && rate <= 25) {
+        lastKnownRate = rate;
+    }
+    return lastKnownRate;
+}
+
+// --- 이동 평균 속도 (보조 보정용) ---
 const speedHistory = [];
-const HISTORY_MAX_LEN = 360; 
+const HISTORY_MAX_LEN = 360;
 
 function updateRealClock() {
     if (!elRealClock) return;
@@ -182,7 +246,7 @@ async function fetchTelemetry() {
 
         if (!game.connected) { elNavDistance.innerText = '미연결'; return; }
 
-        // 트럭이 정차해있지 않고 게임이 일시정지가 아닐 경우에만 속도 기록 누적
+        // 속도 기록 누적 (보조 보정용)
         if (!game.paused && truck.speed > 0) {
             speedHistory.push(truck.speed);
             if (speedHistory.length > HISTORY_MAX_LEN) speedHistory.shift();
@@ -213,29 +277,65 @@ async function fetchTelemetry() {
         const distKm = Math.round(navigation.estimatedDistance / 1000);
         elNavDistance.innerText = `${distKm} km`;
 
-        // ETS2의 game.timeScale은 도심/주유소에서 3으로 떨어짐
-        // 이 때 남은 전체 시간을 3으로 나누면 현실 도착 예상 시간이 무려 6배 이상 폭증하는 버그가 발생함
-        // 따라서 계산용 배율은 최소 15(유럽 19, 영국 15)로 고정하여 안정적인 현실 시간 산출
-        let safeScale = game.timeScale || 19;
-        if (safeScale < 15) safeScale = 19; 
-
+        // ============================================
+        // [프리미엄 ETA 산출]
+        // 방법 1: 타이머 소진율 (navigation.estimatedTime 변화 추적)
+        // 방법 2: 도시 근접도 기반 timeScale + 속도 결합 (폴백)
+        // ============================================
         if (distKm > 1) {
-            // [속도 계산 방식: 하이브리드(Mode 3) 적용]
-            // 최근 3분 실시간 평균 속도 반영 (최소 62 보장)
-            let avgKmh = 62;
-            if (speedHistory.length > 0) {
-                const avg = speedHistory.reduce((a, b) => a + b, 0) / speedHistory.length;
-                avgKmh = Math.max(62, avg);
-            }
-            // 평균 속도보다 지금 과속 중이라면 현재 속도를 기준
-            let chosenAvgSpeed = Math.max(avgKmh, truck.speed > 0 ? truck.speed : 0);
-            
-            // 만약 현재 정차(0km/h) 중이라면 무한대가 되지 않게 62km/h 보정
-            chosenAvgSpeed = Math.max(62, chosenAvgSpeed);
+            let irlMinutes = 0;
 
-            const irlMinutes = Math.floor((distKm / chosenAvgSpeed) * 60 / safeScale);
+            // === 방법 1: 게임 네비 타이머 소진율 기반 ===
+            const gameMinRemaining = parseGameMinutes(navigation.estimatedTime);
+            if (gameMinRemaining > 0) {
+                updateTimerHistory(gameMinRemaining);
+            }
+
+            const countdownRate = getCountdownRate();
+
+            if (gameMinRemaining > 0 && countdownRate > 0) {
+                // 기본 계산: 남은 게임 분 / 소진율 = 현실 분
+                irlMinutes = gameMinRemaining / countdownRate;
+
+                // === 도시 근접도 보정 ===
+                // 현재 위치의 실제 timeScale을 판정하여 소진율 보정
+                const truckX = truck.placement ? truck.placement.x : 0;
+                const truckZ = truck.placement ? truck.placement.z : 0;
+                const currentTrueScale = getTimeScale(truckX, truckZ);
+
+                // 만약 소진율이 고속도로(~19) 기준인데 현재 도심(3)이면,
+                // 남은 구간에서 도심 시간이 더 필요 → ETA 상향 보정
+                if (currentTrueScale === 3 && countdownRate > 10) {
+                    // 도심인데 소진율이 아직 고속 기준 → 보정 계수 적용
+                    // 남은 거리가 짧을수록(도심 비중 높을수록) 보정 강화
+                    const cityWeight = Math.min(1, 30 / Math.max(distKm, 1));
+                    const correctedRate = countdownRate * (1 - cityWeight) + 3 * cityWeight;
+                    irlMinutes = gameMinRemaining / correctedRate;
+                }
+                
+                // 반대: 현재 고속인데 소진율이 도심 기준이면 → ETA 하향 보정
+                if (currentTrueScale === 19 && countdownRate < 8) {
+                    const hwWeight = Math.min(1, 30 / Math.max(distKm, 1));
+                    const correctedRate = countdownRate * (1 - hwWeight) + 19 * hwWeight;
+                    irlMinutes = gameMinRemaining / correctedRate;
+                }
+            }
+
+            // === 방법 2 폴백: 소진율 데이터 부족 시 도시 근접도만으로 계산 ===
+            if (irlMinutes <= 0) {
+                const truckX = truck.placement ? truck.placement.x : 0;
+                const truckZ = truck.placement ? truck.placement.z : 0;
+                const scale = getTimeScale(truckX, truckZ);
+                
+                // 게임 속도 추정: 도심 35km/h, 고속 70km/h
+                const estimatedGameSpeed = (scale === 3) ? 35 : 70;
+                irlMinutes = Math.floor((distKm / estimatedGameSpeed) * 60 / scale);
+            }
+
+            // 최소 1분 보장 (0분 표시 방지)
+            irlMinutes = Math.max(1, Math.round(irlMinutes));
+
             const arrivalDate = new Date(Date.now() + irlMinutes * 60000);
-            
             let irlHours = arrivalDate.getHours();
             const ampm = irlHours >= 12 ? '오후' : '오전';
             irlHours = irlHours % 12 || 12;

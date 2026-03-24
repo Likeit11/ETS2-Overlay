@@ -155,9 +155,17 @@ const elNavDistance = document.getElementById('nav-distance');
 const elNavEta = document.getElementById('nav-eta');
 const elRealClock = document.getElementById('real-clock');
 
-// 이동 평균 속도 계산을 위한 배열 (0.5초마다 업데이트되므로 3분 = 360개)
-const speedHistory = [];
-const HISTORY_MAX_LEN = 360; 
+// timeScale 스무딩 (도심↔고속 전환 시 ETA 널뛰기 방지)
+let smoothedScale = 19;
+
+// 게임 시간 파싱: "0001-01-01T03:01:40Z" → 분 단위 duration
+function parseGameMinutes(timeStr) {
+    if (!timeStr) return 0;
+    const d = new Date(timeStr);
+    const base = new Date('0001-01-01T00:00:00Z');
+    const ms = d.getTime() - base.getTime();
+    return ms > 0 ? ms / 60000 : 0;
+}
 
 function updateRealClock() {
     if (!elRealClock) return;
@@ -181,12 +189,6 @@ async function fetchTelemetry() {
         const { game, truck, trailer, job, navigation } = data;
 
         if (!game.connected) { elNavDistance.innerText = '미연결'; return; }
-
-        // 트럭이 정차해있지 않고 게임이 일시정지가 아닐 경우에만 속도 기록 누적
-        if (!game.paused && truck.speed > 0) {
-            speedHistory.push(truck.speed);
-            if (speedHistory.length > HISTORY_MAX_LEN) speedHistory.shift();
-        }
 
         const maxTruckWear = Math.max(truck.wearEngine, truck.wearTransmission, truck.wearCabin, truck.wearChassis, truck.wearWheels);
         elTruckDamage.innerText = `${Math.round(maxTruckWear * 100)}%`;
@@ -213,59 +215,22 @@ async function fetchTelemetry() {
         const distKm = Math.round(navigation.estimatedDistance / 1000);
         elNavDistance.innerText = `${distKm} km`;
 
-        // [네비게이션 맵 데이터 역산 + 실시간 속도 하이브리드 결합 방식]
-        let safeScale = game.timeScale || 19;
-        let isAts = game.gameName === 'ATS';
-        let highwayScale = isAts ? 20 : 19;
-        let cityScale = 3;
-
+        // ============================================
+        // [인게임 네비 직결 ETA]
+        // 게임 엔진이 계산한 남은 시간을 그대로 신뢰하고,
+        // timeScale만 스무딩하여 현실 시간으로 치환
+        // ============================================
         if (distKm > 1) {
-            let irlMinutes = 0;
-            let currentSpeedKmh = Math.abs(truck.speed > 0 ? truck.speed : 0);
+            const gameMinRemaining = parseGameMinutes(navigation.estimatedTime);
 
-            if (navigation.estimatedTime && game.time) {
-                let tGameEnd = new Date(navigation.estimatedTime).getTime();
-                let tGameNow = new Date(game.time).getTime();
-                
-                if (!isNaN(tGameEnd) && !isNaN(tGameNow) && tGameEnd > tGameNow) {
-                    let tGameHours = (tGameEnd - tGameNow) / 3600000;
-                    
-                    let D_c = (70 * tGameHours) - distKm;
-                    if (D_c < 0) D_c = 0;
-                    if (D_c > distKm) D_c = distKm;
-                    let D_h = distKm - D_c;
+            // timeScale 스무딩 (급변 방지, 지수이동평균)
+            const rawScale = game.timeScale || 19;
+            smoothedScale = smoothedScale * 0.95 + rawScale * 0.05;
 
-                    let realHoursCity = (D_c / 35) / cityScale;
-                    let realHoursHighway = (D_h / 70) / highwayScale;
-                    let theoreticalIrlMinutes = (realHoursCity + realHoursHighway) * 60;
-                    
-                    let avgKmh = 62; 
-                    if (speedHistory.length > 0) {
-                        const avg = speedHistory.reduce((a, b) => a + b, 0) / speedHistory.length;
-                        avgKmh = Math.max(30, avg); 
-                    }
-                    let chosenAvgSpeed = Math.max(avgKmh, currentSpeedKmh);
-                    chosenAvgSpeed = Math.max(40, chosenAvgSpeed); 
-
-                    let dynamicSpeedRatio = 62 / chosenAvgSpeed;
-                    irlMinutes = Math.floor(theoreticalIrlMinutes * dynamicSpeedRatio);
-                }
-            }
-            
-            if (irlMinutes === 0) {
-                let avgKmh = 62;
-                if (speedHistory.length > 0) {
-                    const avg = speedHistory.reduce((a, b) => a + b, 0) / speedHistory.length;
-                    avgKmh = Math.max(62, avg);
-                }
-                let chosenAvgSpeed = Math.max(avgKmh, currentSpeedKmh);
-                chosenAvgSpeed = Math.max(62, chosenAvgSpeed);
-                if (safeScale < 15) safeScale = 19;
-                irlMinutes = Math.floor((distKm / chosenAvgSpeed) * 60 / safeScale);
-            }
+            // 현실 시간 = 게임 남은 시간 / 스무딩된 배율
+            let irlMinutes = Math.max(1, Math.round(gameMinRemaining / smoothedScale));
 
             const arrivalDate = new Date(Date.now() + irlMinutes * 60000);
-            
             let irlHours = arrivalDate.getHours();
             const ampm = irlHours >= 12 ? '오후' : '오전';
             irlHours = irlHours % 12 || 12;

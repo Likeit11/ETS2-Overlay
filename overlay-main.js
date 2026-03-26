@@ -107,6 +107,15 @@ function createWindow() {
     win.setIgnoreMouseEvents(isLocked, { forward: true });
     win.loadURL('http://127.0.0.1:25555/skins/my_overlay/index.html');
 
+    win.webContents.on('console-message', (event, level, message, line, sourceId) => {
+        const levelTag = level === 2 ? 'ERROR' : level === 1 ? 'WARN' : 'LOG';
+        console.log(`[Renderer:${levelTag}] ${message} (${sourceId}:${line})`);
+    });
+
+    win.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
+        console.error(`[OverlayLoadError] code=${errorCode} url=${validatedURL} desc=${errorDescription}`);
+    });
+
     registerShortcuts();
 }
 

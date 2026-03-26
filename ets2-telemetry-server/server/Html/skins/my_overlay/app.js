@@ -1,7 +1,7 @@
 const TELEMETRY_URL = "/api/ets2/telemetry";
 
-const ROUTE_DATA_BASE = "skins/my_overlay/data/ets2";
-const CITY_ZONES_URL = "skins/my_overlay/cities_ets2.json";
+const ROUTE_DATA_BASE = "/skins/my_overlay/data/ets2";
+const CITY_ZONES_URL = "/skins/my_overlay/cities_ets2.json";
 const GRAPH_NODES_URL = `${ROUTE_DATA_BASE}/roadnetwork/nodes.json`;
 const GRAPH_EDGES_URL = `${ROUTE_DATA_BASE}/roadnetwork/edges.json`;
 const GEO_CITIES_URL = `${ROUTE_DATA_BASE}/map-data/cities.geojson`;
@@ -11,7 +11,13 @@ const CITY_ALIAS_URL = `${ROUTE_DATA_BASE}/map-data/citiesCheck.json`;
 const ROUTE_RECALC_MIN_INTERVAL_MS = 20_000;
 const ROUTE_FORCE_RECALC_MS = 180_000;
 const ROUTE_DEVIATION_RECALC_COOLDOWN_MS = 8_000;
-const ROUTE_OFFROUTE_RECALC_KM = 0.45;
+const ROUTE_OFFROUTE_RECALC_KM = 1.5;
+const ROUTE_OFFROUTE_MIN_SPEED_KMH = 20;
+const ROUTE_OFFROUTE_GRACE_MS = 15_000;
+const ROUTE_NO_CACHE_RETRY_MS = 5_000;
+const ETA_BOOTSTRAP_WAIT_MS = 2_500;
+const DEBUG_ROUTE_LOG = true;
+const DEBUG_ROUTE_LOG_INTERVAL_MS = 2_000;
 
 const GAME_SPEED_CITY = 35;
 const GAME_SPEED_HIGHWAY = 70;
@@ -193,7 +199,46 @@ const routeEngine = {
     etaSmoothedMinutes: 0,
     etaUpdatedAtMs: 0,
     arrivalSinceMs: 0,
+    etaBootstrapSinceMs: 0,
+    lastEtaMode: "",
+    debugLogTimes: {},
 };
+
+function routeLog(event, payload = null) {
+    if (!DEBUG_ROUTE_LOG) return;
+    if (payload === null) {
+        console.log(`[RouteDebug] ${event}`);
+    } else {
+        let payloadText = "";
+        try {
+            payloadText = ` ${JSON.stringify(payload)}`;
+        } catch (_) {
+            payloadText = " [unserializable-payload]";
+        }
+        console.log(`[RouteDebug] ${event}${payloadText}`);
+    }
+}
+
+function routeLogThrottled(key, event, payload = null, intervalMs = DEBUG_ROUTE_LOG_INTERVAL_MS) {
+    if (!DEBUG_ROUTE_LOG) return;
+    const now = Date.now();
+    const last = routeEngine.debugLogTimes[key] || 0;
+    if (now - last < intervalMs) return;
+    routeEngine.debugLogTimes[key] = now;
+    routeLog(event, payload);
+}
+
+async function fetchJsonStrict(url, label) {
+    const response = await fetch(url, { cache: "no-store" });
+    if (!response.ok) {
+        throw new Error(`${label} load failed (HTTP ${response.status}) at ${url}`);
+    }
+    try {
+        return await response.json();
+    } catch (error) {
+        throw new Error(`${label} invalid JSON at ${url}: ${error?.message || error}`);
+    }
+}
 
 function normalizeName(value) {
     return String(value || "")
@@ -304,6 +349,7 @@ function projectPointToSegmentGeo(px, py, ax, ay, bx, by) {
 async function initializeRouteEngine() {
     if (routeEngine.initialized || routeEngine.loading) return routeEngine.initialized;
     routeEngine.loading = true;
+    routeLog("engine_init_start");
 
     try {
         const [
@@ -314,13 +360,20 @@ async function initializeRouteEngine() {
             companiesGeo,
             cityAliasList,
         ] = await Promise.all([
-            fetch(CITY_ZONES_URL).then((r) => r.json()),
-            fetch(GRAPH_NODES_URL).then((r) => r.json()),
-            fetch(GRAPH_EDGES_URL).then((r) => r.json()),
-            fetch(GEO_CITIES_URL).then((r) => r.json()),
-            fetch(GEO_COMPANIES_URL).then((r) => r.json()),
-            fetch(CITY_ALIAS_URL).then((r) => r.json()),
+            fetchJsonStrict(CITY_ZONES_URL, "cityZones"),
+            fetchJsonStrict(GRAPH_NODES_URL, "graphNodes"),
+            fetchJsonStrict(GRAPH_EDGES_URL, "graphEdges"),
+            fetchJsonStrict(GEO_CITIES_URL, "citiesGeo"),
+            fetchJsonStrict(GEO_COMPANIES_URL, "companiesGeo"),
+            fetchJsonStrict(CITY_ALIAS_URL, "cityAliasList"),
         ]);
+
+        if (!Array.isArray(packedNodes) || packedNodes.length === 0) {
+            throw new Error(`graphNodes empty or invalid. type=${typeof packedNodes}`);
+        }
+        if (!Array.isArray(packedEdges) || packedEdges.length === 0) {
+            throw new Error(`graphEdges empty or invalid. type=${typeof packedEdges}`);
+        }
 
         routeEngine.cityZones = Array.isArray(cityZones) ? cityZones : [];
         routeEngine.cityAliasList = Array.isArray(cityAliasList) ? cityAliasList : [];
@@ -353,11 +406,25 @@ async function initializeRouteEngine() {
         }
         routeEngine.companies = companyList;
 
+        if (routeEngine.cityByName.size === 0) {
+            throw new Error("citiesGeo parsed but cityByName is empty");
+        }
+        if (routeEngine.companies.length === 0) {
+            throw new Error("companiesGeo parsed but companies list is empty");
+        }
+
         buildGraphRuntime(packedNodes, packedEdges);
         routeEngine.initialized = true;
+        routeLog("engine_init_done", {
+            cityZones: routeEngine.cityZones.length,
+            cities: routeEngine.cityByName.size,
+            companies: routeEngine.companies.length,
+            nodeCount: routeEngine.nodeCount,
+        });
         return true;
     } catch (error) {
         console.error("[RouteEngine] Initialization failed:", error);
+        routeLog("engine_init_failed", { message: error?.message || String(error) });
         routeEngine.initialized = false;
         return false;
     } finally {
@@ -422,6 +489,11 @@ function buildGraphRuntime(packedNodes, packedEdges) {
     routeEngine.edgeWeight = edgeWeight;
     routeEngine.edgeRoadType = edgeRoadType;
     routeEngine.spatialMap = spatial;
+    routeLog("graph_runtime_built", {
+        nodes: nodeCount,
+        edges: edgeCount,
+        cells: spatial.size,
+    });
 }
 
 function getClosestNodeIds(lng, lat, maxCount, maxRing = 8) {
@@ -833,18 +905,24 @@ function updateEffectiveSpeedKmh(truck, navigation, game) {
     return routeEngine.speedEmaKmh;
 }
 
-function getLiveEtaWeight(remainingKm, speedDeltaEmaKmh) {
-    let weight = 0.25;
-    if (remainingKm <= 120) weight = 0.35;
-    if (remainingKm <= 60) weight = 0.5;
+function getLiveEtaWeight(remainingKm, speedDeltaEmaKmh, effectiveSpeedKmh) {
+    let weight = 0;
+    if (remainingKm <= 120) weight = 0.2;
+    if (remainingKm <= 60) weight = 0.35;
     if (remainingKm <= ETA_NEAR_BLEND_START_KM) weight = 0.65;
     if (remainingKm <= ETA_NEAR_BLEND_FULL_KM) weight = 0.85;
+
+    if (effectiveSpeedKmh < 10 && remainingKm > ETA_NEAR_BLEND_START_KM) {
+        weight *= 0.1;
+    } else if (effectiveSpeedKmh < ETA_MIN_EFFECTIVE_SPEED_KMH && remainingKm > 60) {
+        weight *= 0.25;
+    }
 
     // 속도 변동이 큰 구간에서는 실시간 속도 비중을 조금 줄여 ETA 튐 방지
     if (speedDeltaEmaKmh > 18) weight *= 0.85;
     if (speedDeltaEmaKmh > 30) weight *= 0.75;
 
-    return Math.max(0.15, Math.min(0.9, weight));
+    return Math.max(0, Math.min(0.9, weight));
 }
 
 function smoothEtaMinutes(rawEtaMinutes) {
@@ -863,6 +941,15 @@ function smoothEtaMinutes(rawEtaMinutes) {
     routeEngine.etaSmoothedMinutes = smoothed;
     routeEngine.etaUpdatedAtMs = now;
     return smoothed;
+}
+
+function logEtaMode(mode, info = {}) {
+    if (routeEngine.lastEtaMode !== mode) {
+        routeEngine.lastEtaMode = mode;
+        routeLog(`eta_mode_${mode}`, info);
+        return;
+    }
+    routeLogThrottled(`eta_mode_${mode}`, `eta_mode_${mode}`, info);
 }
 
 function isArrivalState(routeEta, navigationDistanceKm, truckSpeedKmh, hasJob) {
@@ -919,6 +1006,13 @@ async function buildRouteForJob(truck, job) {
     const startCandidates = getClosestNodeIds(truckGeo[0], truckGeo[1], 8);
     const endCandidates = getClosestNodeIds(destinationGeo[0], destinationGeo[1], 24);
     if (!startCandidates.length || !endCandidates.length) return null;
+    routeLog("route_build_start", {
+        jobKey: buildJobKey(job),
+        startCandidates: startCandidates.length,
+        endCandidates: endCandidates.length,
+        snappedDestination: !!(snapped && snapped.used),
+        snapDistanceKm: snapped ? Number(snapped.distKm.toFixed(3)) : null,
+    });
 
     const headingDeg =
         typeof truckPlacement.heading === "number"
@@ -926,7 +1020,9 @@ async function buildRouteForJob(truck, job) {
             : null;
 
     let best = null;
+    let attemptCount = 0;
     for (let i = 0; i < startCandidates.length; i++) {
+        attemptCount++;
         const candidate = calculateRoute(startCandidates[i], endCandidates, headingDeg);
         if (!candidate) continue;
         if (!best || candidate.path.length < best.path.length) best = candidate;
@@ -935,6 +1031,13 @@ async function buildRouteForJob(truck, job) {
 
     if (!best) return null;
     const stats = buildRouteStats(best.path);
+    routeLog("route_build_success", {
+        attempts: attemptCount,
+        pathNodes: best.path.length,
+        gameMinutes: Number(stats.totalGameMin.toFixed(2)),
+        realMinutes: Number(stats.totalRealMin.toFixed(2)),
+        gameKm: Number(stats.totalGameKm.toFixed(2)),
+    });
 
     return {
         key: buildJobKey(job),
@@ -951,9 +1054,11 @@ async function buildRouteForJob(truck, job) {
 async function ensureRouteCache(truck, job, options = {}) {
     const force = !!options.force;
     if (!job?.destinationCity || !job?.destinationCompany) {
+        routeLogThrottled("no_job", "cache_clear_no_job");
         routeEngine.routeCache = null;
         routeEngine.etaSmoothedMinutes = 0;
         routeEngine.etaUpdatedAtMs = 0;
+        routeEngine.etaBootstrapSinceMs = 0;
         return;
     }
 
@@ -963,16 +1068,35 @@ async function ensureRouteCache(truck, job, options = {}) {
     const routeExpired =
         !hasValid ||
         now - routeEngine.routeCache.createdAt > ROUTE_FORCE_RECALC_MS;
-    if (!routeExpired && !force) return;
+    if (!routeExpired && !force) {
+        routeLogThrottled("cache_ok", "cache_reuse", {
+            key,
+            ageMs: now - routeEngine.routeCache.createdAt,
+        });
+        return;
+    }
 
-    if (routeEngine.routeInFlight) return;
+    if (routeEngine.routeInFlight) {
+        routeLogThrottled("inflight", "cache_wait_inflight", { key });
+        return;
+    }
     const minInterval = force
         ? ROUTE_DEVIATION_RECALC_COOLDOWN_MS
-        : ROUTE_RECALC_MIN_INTERVAL_MS;
-    if (now - routeEngine.lastRouteTryAt < minInterval) return;
+        : routeEngine.routeCache
+            ? ROUTE_RECALC_MIN_INTERVAL_MS
+            : ROUTE_NO_CACHE_RETRY_MS;
+    if (now - routeEngine.lastRouteTryAt < minInterval) {
+        routeLogThrottled("cooldown", "cache_wait_cooldown", {
+            key,
+            waitLeftMs: Math.max(0, minInterval - (now - routeEngine.lastRouteTryAt)),
+            force,
+        });
+        return;
+    }
 
     routeEngine.lastRouteTryAt = now;
     routeEngine.routeInFlight = true;
+    routeLog("cache_rebuild_start", { key, force, routeExpired });
     try {
         const route = await buildRouteForJob(truck, job);
         if (route) {
@@ -980,6 +1104,7 @@ async function ensureRouteCache(truck, job, options = {}) {
             routeEngine.lastPathIndex = 0;
             routeEngine.etaSmoothedMinutes = 0;
             routeEngine.etaUpdatedAtMs = 0;
+            routeEngine.etaBootstrapSinceMs = 0;
             console.log(
                 `[RouteEngine] Route built. nodes=${route.pathNodeIds.length}, game=${route.totalGameMin.toFixed(
                     1,
@@ -987,9 +1112,21 @@ async function ensureRouteCache(truck, job, options = {}) {
                     route.destinationSnapDistKm ?? 0
                 ).toFixed(2)}km`,
             );
+            routeLog("cache_rebuild_success", {
+                key,
+                pathNodes: route.pathNodeIds.length,
+                realMinutes: Number(route.totalRealMin.toFixed(2)),
+            });
+        } else {
+            console.warn("[RouteEngine] Route build returned null");
+            routeLog("cache_rebuild_null", { key });
         }
     } catch (error) {
         console.error("[RouteEngine] Route build failed:", error);
+        routeLog("cache_rebuild_failed", {
+            key,
+            message: error?.message || String(error),
+        });
     } finally {
         routeEngine.routeInFlight = false;
     }
@@ -1020,13 +1157,18 @@ function estimateRealEtaFromRoute(truck, navigation, game) {
         routeModelReal *= clamped;
     }
 
-    const speed = Math.max(
-        ETA_MIN_EFFECTIVE_SPEED_KMH,
-        updateEffectiveSpeedKmh(truck, navigation, game) || 0,
+    const liveSpeed = Math.max(0, updateEffectiveSpeedKmh(truck, navigation, game) || 0);
+    const speedForEta = Math.max(ETA_MIN_EFFECTIVE_SPEED_KMH, liveSpeed);
+    const speedBasedRealMin = speedForEta > 0 ? (remKm / speedForEta) * 60 : routeModelReal;
+    const liveWeight = getLiveEtaWeight(
+        remKm,
+        routeEngine.speedDeltaEmaKmh,
+        liveSpeed,
     );
-    const speedBasedRealMin = speed > 0 ? (remKm / speed) * 60 : routeModelReal;
-    const liveWeight = getLiveEtaWeight(remKm, routeEngine.speedDeltaEmaKmh);
-    let remReal = routeModelReal * (1 - liveWeight) + speedBasedRealMin * liveWeight;
+    let remReal =
+        liveWeight > 0
+            ? routeModelReal * (1 - liveWeight) + speedBasedRealMin * liveWeight
+            : routeModelReal;
     remReal = Math.max(1, remReal);
     remReal = smoothEtaMinutes(remReal);
 
@@ -1035,6 +1177,10 @@ function estimateRealEtaFromRoute(truck, navigation, game) {
         remainingKm: remKm,
         offRouteKm: progress.distKm,
         segmentIndex: progress.segmentIndex,
+        routeModelRealMinutes: routeModelReal,
+        speedBasedRealMinutes: speedBasedRealMin,
+        liveWeight,
+        liveSpeedKmh: liveSpeed,
     };
 }
 
@@ -1249,6 +1395,7 @@ async function fetchTelemetry() {
         if (!game.connected) {
             elNavDistance.innerText = "미연결";
             elNavEta.innerText = "-";
+            logEtaMode("disconnected");
             return;
         }
 
@@ -1270,6 +1417,9 @@ async function fetchTelemetry() {
         elTrailerDamage.innerText = trailer.attached ? `${Math.round(trailer.wear * 100)}%` : "0%";
 
         if (hasJob) {
+            if (!routeEngine.etaBootstrapSinceMs) {
+                routeEngine.etaBootstrapSinceMs = Date.now();
+            }
             elJobSource.innerText = `${job.sourceCity}, ${job.sourceCompany}`;
             elJobDest.innerText = `${job.destinationCity}, ${job.destinationCompany}`;
             elCargoInfo.innerText = `${trailer.name || "화물 없음"} (${trailer.mass ? Math.round(trailer.mass / 1000) : 0} t)`;
@@ -1285,6 +1435,7 @@ async function fetchTelemetry() {
             routeEngine.etaSmoothedMinutes = 0;
             routeEngine.etaUpdatedAtMs = 0;
             routeEngine.arrivalSinceMs = 0;
+            routeEngine.etaBootstrapSinceMs = 0;
         }
 
         elFuelConsumption.innerText = `${(truck.fuelAverageConsumption * 100).toFixed(1)} l/100km`;
@@ -1296,11 +1447,45 @@ async function fetchTelemetry() {
         await ensureRouteCache(truck, job);
 
         const routeEta = estimateRealEtaFromRoute(truck, navigation, game);
-        if (routeEta && routeEta.offRouteKm >= ROUTE_OFFROUTE_RECALC_KM && distKm > 1) {
+        const routeAgeMs = routeEngine.routeCache
+            ? Date.now() - routeEngine.routeCache.createdAt
+            : 0;
+        const truckSpeedKmh = Math.max(0, Number(truck.speed || 0));
+        if (
+            routeEta &&
+            routeEta.offRouteKm >= ROUTE_OFFROUTE_RECALC_KM &&
+            distKm > 1 &&
+            truckSpeedKmh >= ROUTE_OFFROUTE_MIN_SPEED_KMH &&
+            routeAgeMs >= ROUTE_OFFROUTE_GRACE_MS
+        ) {
+            routeLog("offroute_reroute_trigger", {
+                offRouteKm: Number(routeEta.offRouteKm.toFixed(3)),
+                navKm: distKm,
+                speedKmh: Number(truckSpeedKmh.toFixed(1)),
+                routeAgeMs,
+            });
             await ensureRouteCache(truck, job, { force: true });
         }
 
-        const etaRealMinutes = routeEta?.realMinutes || 0;
+        let etaRealMinutes = routeEta?.realMinutes || 0;
+        if (!etaRealMinutes && hasJob) {
+            const waitedMs = routeEngine.etaBootstrapSinceMs
+                ? Date.now() - routeEngine.etaBootstrapSinceMs
+                : 0;
+            if (waitedMs >= ETA_BOOTSTRAP_WAIT_MS) {
+                const navGameMin = parseGameMinutes(navigation?.estimatedTime);
+                const scale = Math.max(1, Number(game.timeScale || 19));
+                if (navGameMin > 0) etaRealMinutes = navGameMin / scale;
+                if (etaRealMinutes > 0) {
+                    logEtaMode("nav_fallback", {
+                        navGameMin: Number(navGameMin.toFixed(2)),
+                        scale: Number(scale.toFixed(2)),
+                        etaMin: Number(etaRealMinutes.toFixed(2)),
+                        distKm,
+                    });
+                }
+            }
+        }
 
         const arrived = isArrivalState(
             routeEta,
@@ -1311,6 +1496,7 @@ async function fetchTelemetry() {
 
         if (arrived) {
             elNavEta.innerText = "도착";
+            logEtaMode("arrived", { distKm, speed: Number((truck.speed || 0).toFixed(1)) });
         } else if (etaRealMinutes && distKm > 0) {
             const etaText = formatEtaText(etaRealMinutes);
             const arrival = new Date(Date.now() + etaRealMinutes * 60000);
@@ -1319,14 +1505,39 @@ async function fetchTelemetry() {
             h = h % 12 || 12;
             const mm = String(arrival.getMinutes()).padStart(2, "0");
             elNavEta.innerText = `${etaText} - ${h}:${mm} ${ampm}`;
+            if (routeEta) {
+                logEtaMode("route", {
+                    etaMin: Number(etaRealMinutes.toFixed(2)),
+                    remKm: Number(routeEta.remainingKm.toFixed(2)),
+                    offRouteKm: Number(routeEta.offRouteKm.toFixed(3)),
+                    speedEma: Number((routeEngine.speedEmaKmh || 0).toFixed(1)),
+                    mode: "route_model",
+                    routeModelMin: Number((routeEta.routeModelRealMinutes || 0).toFixed(2)),
+                    speedBasedMin: Number((routeEta.speedBasedRealMinutes || 0).toFixed(2)),
+                    liveWeight: Number((routeEta.liveWeight || 0).toFixed(2)),
+                });
+            } else {
+                logEtaMode("nav_fallback", {
+                    etaMin: Number(etaRealMinutes.toFixed(2)),
+                    distKm,
+                    mode: "fallback_display",
+                });
+            }
         } else if (hasJob) {
             elNavEta.innerText = "계산 중...";
+            logEtaMode("calculating", {
+                distKm,
+                hasRouteCache: !!routeEngine.routeCache,
+                routeInFlight: routeEngine.routeInFlight,
+            });
         } else {
             elNavEta.innerText = "-";
+            logEtaMode("idle");
         }
     } catch (error) {
         console.error("Telemetry error:", error);
         elNavEta.innerText = `오류: ${error.message}`;
+        routeLog("telemetry_error", { message: error?.message || String(error) });
     }
 }
 

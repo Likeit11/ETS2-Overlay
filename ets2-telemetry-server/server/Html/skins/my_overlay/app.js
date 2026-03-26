@@ -1300,12 +1300,7 @@ async function fetchTelemetry() {
             await ensureRouteCache(truck, job, { force: true });
         }
 
-        let etaRealMinutes = routeEta?.realMinutes || 0;
-        if (!etaRealMinutes && distKm > 0) {
-            const navGameMin = parseGameMinutes(navigation?.estimatedTime);
-            const scale = game.timeScale || 19;
-            etaRealMinutes = navGameMin > 0 ? navGameMin / scale : Math.max(1, distKm / 1.2);
-        }
+        const etaRealMinutes = routeEta?.realMinutes || 0;
 
         const arrived = isArrivalState(
             routeEta,

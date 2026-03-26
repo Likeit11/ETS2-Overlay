@@ -47,6 +47,8 @@ Build a stable real-time ETA calculation for the overlay by reducing time-scale 
 - live-speed influence now applies across full route (distance-based weight)
 - added speed-volatility aware weighting to reduce jitter
 - added ETA smoothing on top of raw prediction for stable updates
+- Removed startup fallback ETA popup:
+- during first route bootstrap, show "계산 중..." instead of temporary rough ETA value
 
 ## Additional Proposals (Backlog)
 - Deferred for now: log replay benchmark (compare predicted ETA vs real arrival over recorded trips).

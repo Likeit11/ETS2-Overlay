@@ -13,6 +13,52 @@ body, html { margin: 0; padding: 0; width: 100vw; height: 100vh; overflow: hidde
 i { width: 16px; text-align: center; color: #a0a0a0; font-size: 14px; }
 span[id] { color: #ffffff; text-shadow: 0px 1px 2px rgba(0, 0, 0, 0.5); }
 
+.eta-eval-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1.2;
+    letter-spacing: 0.2px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    text-shadow: none;
+}
+.eta-eval-pill::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    display: inline-block;
+}
+.eta-eval-pill.on {
+    color: #d8ffe2;
+    background: rgba(39, 138, 78, 0.35);
+    border-color: rgba(84, 214, 141, 0.6);
+}
+.eta-eval-pill.on::before {
+    background: #55ff9e;
+    box-shadow: 0 0 6px rgba(85, 255, 158, 0.9);
+}
+.eta-eval-pill.wait {
+    color: #fff2d4;
+    background: rgba(162, 113, 28, 0.35);
+    border-color: rgba(255, 203, 103, 0.6);
+}
+.eta-eval-pill.wait::before {
+    background: #ffd16b;
+}
+.eta-eval-pill.off {
+    color: #ffd8d8;
+    background: rgba(146, 50, 50, 0.35);
+    border-color: rgba(255, 120, 120, 0.55);
+}
+.eta-eval-pill.off::before {
+    background: #ff8585;
+}
+
 /* 모달 및 안내 배너 관련 스타일 */
 .status-banner { position:fixed; top:20px; left:50%; transform:translateX(-50%); background:rgba(255,100,0,0.85); color:white; padding:8px 20px; border-radius:12px; z-index:9999; font-weight:700; text-shadow:0 1px 2px rgba(0,0,0,0.5); font-size:15px; }
 .modal { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000; pointer-events: auto; }

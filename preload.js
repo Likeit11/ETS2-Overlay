@@ -6,5 +6,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     closeOverlay: () => ipcRenderer.send('close-overlay'),
     setLocked: (state) => ipcRenderer.send('set-locked', state),
     suspendShortcuts: () => ipcRenderer.send('suspend-shortcuts'),
-    resumeShortcuts: () => ipcRenderer.send('resume-shortcuts')
+    resumeShortcuts: () => ipcRenderer.send('resume-shortcuts'),
+    etaEvalTick: (payload) => ipcRenderer.send('eta-eval:tick', payload),
+    etaEvalEvent: (payload) => ipcRenderer.send('eta-eval:event', payload),
+    etaEvalTripSummary: (payload) => ipcRenderer.send('eta-eval:trip-summary', payload),
+    getEtaEvalSession: () => ipcRenderer.invoke('eta-eval:get-session')
 });

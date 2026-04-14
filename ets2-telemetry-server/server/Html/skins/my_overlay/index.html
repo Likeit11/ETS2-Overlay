@@ -92,7 +92,10 @@
                 <div class="data-group">
                     <div class="data-row" style="display: flex; justify-content: space-between;">
                         <span><i class="fa-solid fa-route"></i> <span id="nav-distance">0 km</span></span>
-                        <span style="color: #66b3ff;"><i class="fa-regular fa-clock"></i> <span id="real-clock">00:00 오전</span></span>
+                        <span style="display: inline-flex; align-items: center; gap: 8px;">
+                            <span style="color: #66b3ff;"><i class="fa-regular fa-clock"></i> <span id="real-clock">00:00 오전</span></span>
+                            <span id="eta-eval-status" class="eta-eval-pill wait">분석 기록 준비</span>
+                        </span>
                     </div>
                     <div class="data-row">
                         <span class="full-row"><i class="fa-solid fa-hourglass-half"></i> <span id="nav-eta">-분 - 0:00 오후</span></span>

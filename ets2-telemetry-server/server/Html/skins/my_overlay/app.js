@@ -16,8 +16,11 @@ const ROUTE_OFFROUTE_MIN_SPEED_KMH = 20;
 const ROUTE_OFFROUTE_GRACE_MS = 15_000;
 const ROUTE_NO_CACHE_RETRY_MS = 5_000;
 const ETA_BOOTSTRAP_WAIT_MS = 2_500;
+const ETA_EVAL_JOURNEY_STATE_KEY = "eta_eval_journey_state_v1";
+const ETA_EVAL_JOURNEY_RESUME_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const DEBUG_ROUTE_LOG = true;
 const DEBUG_ROUTE_LOG_INTERVAL_MS = 2_000;
+const BENCHMARK_LOG_INTERVAL_MS = 10_000;
 
 const GAME_SPEED_CITY = 35;
 const GAME_SPEED_HIGHWAY = 70;
@@ -25,9 +28,46 @@ const ETA_NEAR_BLEND_START_KM = 30;
 const ETA_NEAR_BLEND_FULL_KM = 20;
 const ETA_MIN_EFFECTIVE_SPEED_KMH = 12;
 const SPEED_EMA_ALPHA = 0.18;
+const SPEED_EMA_STOP_DECAY_ALPHA = 0.28;
 const SPEED_SPIKE_MAX_KMH = 180;
 const SPEED_DELTA_EMA_ALPHA = 0.2;
-const ETA_SMOOTH_ALPHA_BASE = 0.45;
+const ETA_SMOOTH_ALPHA_BASE = 0.26;
+const ETA_SMOOTH_ALPHA_NEAR_BOOST = 0.15;
+const LIVE_WEIGHT_MAX = 0.85;
+const LIVE_WEIGHT_FAR_KM = 120;
+const LIVE_WEIGHT_MID_KM = 60;
+const LIVE_WEIGHT_NEAR_KM = 30;
+const LIVE_WEIGHT_FULL_KM = 20;
+const LIVE_WEIGHT_DIST_AT_MID = 0.2;
+const LIVE_WEIGHT_DIST_AT_NEAR = 0.35;
+const LIVE_WEIGHT_DIST_AT_FULL = 0.65;
+const LIVE_WEIGHT_DIST_AT_FINAL = 0.85;
+const LIVE_SPEED_RELIABILITY_LOW_KMH = 15;
+const LIVE_SPEED_RELIABILITY_MID_KMH = 25;
+const LIVE_SPEED_RELIABILITY_HIGH_KMH = 40;
+const SPEED_BASED_MIN_RATIO = 0.5;
+const SPEED_BASED_MAX_RATIO_FAR = 1.45;
+const SPEED_BASED_MAX_RATIO_MID = 1.65;
+const SPEED_BASED_MAX_RATIO_NEAR = 1.9;
+const SPEED_BASED_MAX_RATIO_FINAL = 2.3;
+const ETA_JUMP_GUARD_UP_BASE_MIN = 0.22;
+const ETA_JUMP_GUARD_UP_RATE_MIN_PER_SEC = 0.45;
+const ETA_JUMP_GUARD_DOWN_BASE_MIN = 0.35;
+const ETA_JUMP_GUARD_DOWN_RATE_MIN_PER_SEC = 0.9;
+const ETA_PROJECTION_STOP_SPEED_KMH = 0.5;
+const ETA_PROJECTION_SLOW_SPEED_KMH = 4;
+const ETA_PROJECTION_LOW_SPEED_KMH = 12;
+const ETA_PROJECTION_MED_SPEED_KMH = 25;
+const ETA_PROJECTION_SLOW_FACTOR = 0.15;
+const ETA_PROJECTION_LOW_FACTOR = 0.35;
+const ETA_PROJECTION_MED_FACTOR = 0.7;
+const ETA_CALIBRATION_BLEND_NEAR_KM = 20;
+const ETA_CALIBRATION_BLEND_MID_KM = 60;
+const ETA_CALIBRATION_BLEND_FAR_KM = 120;
+const ETA_CALIBRATION_BLEND_START_MS = 90_000;
+const ETA_CALIBRATION_BLEND_FULL_MS = 240_000;
+const ETA_CALIBRATION_RATIO_DEVIATION_SOFT = 0.05;
+const ETA_CALIBRATION_RATIO_DEVIATION_HARD = 0.2;
 const DEST_SNAP_RADIUS_KM = 2.5;
 const ARRIVAL_REMAINING_KM_THRESHOLD = 0.35;
 const ARRIVAL_NAV_KM_THRESHOLD = 1.0;
@@ -198,11 +238,196 @@ const routeEngine = {
     lastSpeedKmh: 0,
     etaSmoothedMinutes: 0,
     etaUpdatedAtMs: 0,
+    waitPenaltyMinutes: 0,
+    waitPenaltyUpdatedAtMs: 0,
     arrivalSinceMs: 0,
+    arrivalEventSent: false,
     etaBootstrapSinceMs: 0,
     lastEtaMode: "",
     debugLogTimes: {},
 };
+
+const etaEvalTripState = {
+    activeTripId: "",
+    activeJourneyId: "",
+    activeJourneySegmentIndex: 0,
+    resumedFromTripId: "",
+    activeJobKey: "",
+    startedAtMs: 0,
+    rerouteCount: 0,
+    maxOffRouteKm: 0,
+    speedSum: 0,
+    speedSamples: 0,
+};
+
+const etaEvalUiState = {
+    available: false,
+    sessionId: "",
+    lastTickSentAtMs: 0,
+    lastError: "",
+};
+
+function safeNumber(value, digits = 3) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return null;
+    const factor = 10 ** digits;
+    return Math.round(n * factor) / factor;
+}
+
+function createEtaEvalId(prefix) {
+    const now = Date.now();
+    const randomPart = Math.floor(Math.random() * 1_000_000)
+        .toString()
+        .padStart(6, "0");
+    return `${prefix}_${now}_${randomPart}`;
+}
+
+function readEtaEvalJourneyState() {
+    try {
+        const raw = window.localStorage.getItem(ETA_EVAL_JOURNEY_STATE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === "object" ? parsed : null;
+    } catch {
+        return null;
+    }
+}
+
+function writeEtaEvalJourneyState(state) {
+    try {
+        if (!state) {
+            window.localStorage.removeItem(ETA_EVAL_JOURNEY_STATE_KEY);
+            return;
+        }
+        window.localStorage.setItem(ETA_EVAL_JOURNEY_STATE_KEY, JSON.stringify(state));
+    } catch {}
+}
+
+function clearEtaEvalJourneyState() {
+    writeEtaEvalJourneyState(null);
+}
+
+function getEtaEvalJourneyResume(jobKey) {
+    const state = readEtaEvalJourneyState();
+    if (!state) return null;
+    if (String(state.job_key || "") !== String(jobKey || "")) return null;
+
+    const pendingSinceMs = Number(state.pending_since_ms || 0);
+    if (!pendingSinceMs || Date.now() - pendingSinceMs > ETA_EVAL_JOURNEY_RESUME_MAX_AGE_MS) {
+        clearEtaEvalJourneyState();
+        return null;
+    }
+
+    return state;
+}
+
+function emitEtaEvalEvent(eventName, payload = {}, severity = "info") {
+    if (!window?.electronAPI?.etaEvalEvent) return;
+    try {
+        window.electronAPI.etaEvalEvent({
+            event_name: eventName,
+            severity,
+            payload,
+            trip_id: etaEvalTripState.activeTripId || "",
+            journey_id: etaEvalTripState.activeJourneyId || "",
+            journey_segment_index: etaEvalTripState.activeJourneySegmentIndex || null,
+            resumed_from_trip_id: etaEvalTripState.resumedFromTripId || "",
+            job_key: etaEvalTripState.activeJobKey || "",
+            ts_ms: Date.now(),
+        });
+    } catch (error) {
+        etaEvalUiState.lastError = error?.message || String(error);
+    }
+}
+
+function emitEtaEvalTick(payload = {}) {
+    if (!window?.electronAPI?.etaEvalTick) return;
+    try {
+        window.electronAPI.etaEvalTick({
+            ...payload,
+            trip_id: etaEvalTripState.activeTripId || "",
+            journey_id: etaEvalTripState.activeJourneyId || "",
+            journey_segment_index: etaEvalTripState.activeJourneySegmentIndex || null,
+            resumed_from_trip_id: etaEvalTripState.resumedFromTripId || "",
+            job_key: etaEvalTripState.activeJobKey || "",
+            ts_ms: Date.now(),
+        });
+        etaEvalUiState.lastError = "";
+        etaEvalUiState.lastTickSentAtMs = Date.now();
+    } catch (error) {
+        etaEvalUiState.lastError = error?.message || String(error);
+    }
+}
+
+function emitEtaEvalTripSummary(summary = {}) {
+    if (!window?.electronAPI?.etaEvalTripSummary) return;
+    try {
+        window.electronAPI.etaEvalTripSummary(summary);
+    } catch (error) {
+        etaEvalUiState.lastError = error?.message || String(error);
+    }
+}
+
+function finalizeEtaEvalTrip(endReason, endTsMs = Date.now()) {
+    if (!etaEvalTripState.activeTripId || !etaEvalTripState.startedAtMs) return;
+
+    const actualTripMin = Math.max(0, (endTsMs - etaEvalTripState.startedAtMs) / 60000);
+    const avgSpeedKmh =
+        etaEvalTripState.speedSamples > 0
+            ? etaEvalTripState.speedSum / etaEvalTripState.speedSamples
+            : 0;
+
+    emitEtaEvalEvent("trip_end", {
+        end_reason: endReason,
+        actual_trip_min: safeNumber(actualTripMin, 3),
+        reroute_count: etaEvalTripState.rerouteCount,
+        avg_speed_kmh: safeNumber(avgSpeedKmh, 3),
+        max_offroute_km: safeNumber(etaEvalTripState.maxOffRouteKm, 3),
+    });
+
+    emitEtaEvalTripSummary({
+        trip_id: etaEvalTripState.activeTripId,
+        journey_id: etaEvalTripState.activeJourneyId,
+        journey_segment_index: etaEvalTripState.activeJourneySegmentIndex,
+        resumed_from_trip_id: etaEvalTripState.resumedFromTripId,
+        job_key: etaEvalTripState.activeJobKey,
+        start_ts_ms: etaEvalTripState.startedAtMs,
+        end_ts_ms: endTsMs,
+        actual_trip_min: safeNumber(actualTripMin, 3),
+        reroute_count: etaEvalTripState.rerouteCount,
+        avg_speed_kmh: safeNumber(avgSpeedKmh, 3),
+        max_offroute_km: safeNumber(etaEvalTripState.maxOffRouteKm, 3),
+        end_reason: endReason,
+    });
+
+    if (
+        (endReason === "disconnect" || endReason === "overlay_closed") &&
+        etaEvalTripState.activeJourneyId &&
+        etaEvalTripState.activeJobKey
+    ) {
+        writeEtaEvalJourneyState({
+            journey_id: etaEvalTripState.activeJourneyId,
+            job_key: etaEvalTripState.activeJobKey,
+            next_segment_index: etaEvalTripState.activeJourneySegmentIndex + 1,
+            last_trip_id: etaEvalTripState.activeTripId,
+            pending_since_ms: endTsMs,
+            end_reason: endReason,
+        });
+    } else {
+        clearEtaEvalJourneyState();
+    }
+
+    etaEvalTripState.activeTripId = "";
+    etaEvalTripState.activeJourneyId = "";
+    etaEvalTripState.activeJourneySegmentIndex = 0;
+    etaEvalTripState.resumedFromTripId = "";
+    etaEvalTripState.activeJobKey = "";
+    etaEvalTripState.startedAtMs = 0;
+    etaEvalTripState.rerouteCount = 0;
+    etaEvalTripState.maxOffRouteKm = 0;
+    etaEvalTripState.speedSum = 0;
+    etaEvalTripState.speedSamples = 0;
+}
 
 function routeLog(event, payload = null) {
     if (!DEBUG_ROUTE_LOG) return;
@@ -217,6 +442,10 @@ function routeLog(event, payload = null) {
         }
         console.log(`[RouteDebug] ${event}${payloadText}`);
     }
+    emitEtaEvalEvent("route_event", {
+        event_name: event,
+        payload,
+    });
 }
 
 function routeLogThrottled(key, event, payload = null, intervalMs = DEBUG_ROUTE_LOG_INTERVAL_MS) {
@@ -879,7 +1108,18 @@ function updateEffectiveSpeedKmh(truck, navigation, game) {
     if (!truck || !game?.connected || game?.paused) return routeEngine.speedEmaKmh;
 
     const rawSpeed = Math.max(0, Math.min(SPEED_SPIKE_MAX_KMH, Number(truck.speed || 0)));
-    if (rawSpeed <= 0.1) return routeEngine.speedEmaKmh;
+    if (rawSpeed <= 0.1) {
+        const speedDiff = Math.abs(rawSpeed - routeEngine.lastSpeedKmh);
+        routeEngine.lastSpeedKmh = rawSpeed;
+        routeEngine.speedDeltaEmaKmh =
+            routeEngine.speedDeltaEmaKmh * (1 - SPEED_DELTA_EMA_ALPHA) +
+            speedDiff * SPEED_DELTA_EMA_ALPHA;
+        routeEngine.speedEmaKmh *= 1 - SPEED_EMA_STOP_DECAY_ALPHA;
+        if (!Number.isFinite(routeEngine.speedEmaKmh) || routeEngine.speedEmaKmh < 0.25) {
+            routeEngine.speedEmaKmh = 0;
+        }
+        return routeEngine.speedEmaKmh;
+    }
 
     if (routeEngine.speedEmaKmh <= 0) {
         routeEngine.speedEmaKmh = rawSpeed;
@@ -905,38 +1145,264 @@ function updateEffectiveSpeedKmh(truck, navigation, game) {
     return routeEngine.speedEmaKmh;
 }
 
-function getLiveEtaWeight(remainingKm, speedDeltaEmaKmh, effectiveSpeedKmh) {
-    let weight = 0;
-    if (remainingKm <= 120) weight = 0.2;
-    if (remainingKm <= 60) weight = 0.35;
-    if (remainingKm <= ETA_NEAR_BLEND_START_KM) weight = 0.65;
-    if (remainingKm <= ETA_NEAR_BLEND_FULL_KM) weight = 0.85;
+function getEtaProjectionRate(context = {}) {
+    const remainingKm = Number(context.remainingKm);
+    const truckSpeedKmh = Math.max(0, Number(context.truckSpeedKmh) || 0);
+    const effectiveSpeedKmh = Math.max(0, Number(context.effectiveSpeedKmh) || 0);
 
-    if (effectiveSpeedKmh < 10 && remainingKm > ETA_NEAR_BLEND_START_KM) {
-        weight *= 0.1;
-    } else if (effectiveSpeedKmh < ETA_MIN_EFFECTIVE_SPEED_KMH && remainingKm > 60) {
-        weight *= 0.25;
+    if (context.isPaused) return 0;
+    if (truckSpeedKmh <= ETA_PROJECTION_STOP_SPEED_KMH && remainingKm > 1) return 0;
+    if (effectiveSpeedKmh < ETA_PROJECTION_SLOW_SPEED_KMH && remainingKm > 3) {
+        return ETA_PROJECTION_SLOW_FACTOR;
     }
-
-    // 속도 변동이 큰 구간에서는 실시간 속도 비중을 조금 줄여 ETA 튐 방지
-    if (speedDeltaEmaKmh > 18) weight *= 0.85;
-    if (speedDeltaEmaKmh > 30) weight *= 0.75;
-
-    return Math.max(0, Math.min(0.9, weight));
+    if (effectiveSpeedKmh < ETA_PROJECTION_LOW_SPEED_KMH && remainingKm > 10) {
+        return ETA_PROJECTION_LOW_FACTOR;
+    }
+    if (effectiveSpeedKmh < ETA_PROJECTION_MED_SPEED_KMH && remainingKm > 30) {
+        return ETA_PROJECTION_MED_FACTOR;
+    }
+    return 1;
 }
 
-function smoothEtaMinutes(rawEtaMinutes) {
+function updateEtaWaitPenalty(context = {}) {
     const now = Date.now();
-    if (routeEngine.etaSmoothedMinutes <= 0 || !routeEngine.etaUpdatedAtMs) {
-        routeEngine.etaSmoothedMinutes = rawEtaMinutes;
-        routeEngine.etaUpdatedAtMs = now;
-        return rawEtaMinutes;
+    if (!routeEngine.waitPenaltyUpdatedAtMs) {
+        routeEngine.waitPenaltyUpdatedAtMs = now;
+        return routeEngine.waitPenaltyMinutes;
     }
 
-    const elapsedMin = Math.max(0, (now - routeEngine.etaUpdatedAtMs) / 60000);
-    const projected = Math.max(0, routeEngine.etaSmoothedMinutes - elapsedMin);
-    const smoothed =
-        projected * (1 - ETA_SMOOTH_ALPHA_BASE) + rawEtaMinutes * ETA_SMOOTH_ALPHA_BASE;
+    const elapsedMin = Math.max(0, (now - routeEngine.waitPenaltyUpdatedAtMs) / 60000);
+    routeEngine.waitPenaltyUpdatedAtMs = now;
+    if (elapsedMin <= 0) return routeEngine.waitPenaltyMinutes;
+
+    const remainingKm = Math.max(0, Number(context.remainingKm) || 0);
+    const truckSpeedKmh = Math.max(0, Number(context.truckSpeedKmh) || 0);
+    const effectiveSpeedKmh = Math.max(0, Number(context.effectiveSpeedKmh) || 0);
+    const isPaused = !!context.isPaused;
+
+    if (isPaused && remainingKm > 1) {
+        routeEngine.waitPenaltyMinutes = Math.min(
+            20,
+            routeEngine.waitPenaltyMinutes + elapsedMin,
+        );
+        return routeEngine.waitPenaltyMinutes;
+    }
+
+    if (truckSpeedKmh <= ETA_PROJECTION_STOP_SPEED_KMH && remainingKm > 1) {
+        routeEngine.waitPenaltyMinutes = Math.min(
+            20,
+            routeEngine.waitPenaltyMinutes + elapsedMin * 0.85,
+        );
+        return routeEngine.waitPenaltyMinutes;
+    }
+
+    if (effectiveSpeedKmh < ETA_PROJECTION_LOW_SPEED_KMH && remainingKm > 3) {
+        routeEngine.waitPenaltyMinutes = Math.min(
+            20,
+            routeEngine.waitPenaltyMinutes + elapsedMin * 0.2,
+        );
+        return routeEngine.waitPenaltyMinutes;
+    }
+
+    let decayRate = 0.1;
+    if (effectiveSpeedKmh >= ETA_PROJECTION_MED_SPEED_KMH) {
+        decayRate = 0.35;
+    } else if (effectiveSpeedKmh >= ETA_PROJECTION_LOW_SPEED_KMH) {
+        decayRate = 0.2;
+    }
+    routeEngine.waitPenaltyMinutes = Math.max(
+        0,
+        routeEngine.waitPenaltyMinutes - elapsedMin * decayRate,
+    );
+    return routeEngine.waitPenaltyMinutes;
+}
+
+function getEtaCalibrationBlendWeight(context = {}) {
+    const remainingKm = Math.max(0, Number(context.remainingKm) || 0);
+    const routeAgeMs = Math.max(0, Number(context.routeAgeMs) || 0);
+    const navRatioClamped = Number(context.navRatioClamped);
+    const isPaused = !!context.isPaused;
+
+    let distanceWeight = 0.2;
+    if (remainingKm <= ETA_CALIBRATION_BLEND_NEAR_KM) {
+        distanceWeight = 0.95;
+    } else if (remainingKm <= ETA_CALIBRATION_BLEND_MID_KM) {
+        distanceWeight = 0.65;
+    } else if (remainingKm <= ETA_CALIBRATION_BLEND_FAR_KM) {
+        distanceWeight = 0.4;
+    }
+
+    let ageWeight = 1;
+    if (routeAgeMs <= ETA_CALIBRATION_BLEND_START_MS) {
+        ageWeight = 0.2;
+    } else if (routeAgeMs < ETA_CALIBRATION_BLEND_FULL_MS) {
+        ageWeight = smoothstep01(
+            (routeAgeMs - ETA_CALIBRATION_BLEND_START_MS) /
+                (ETA_CALIBRATION_BLEND_FULL_MS - ETA_CALIBRATION_BLEND_START_MS),
+        );
+    }
+
+    let ratioTrustWeight = 1;
+    if (Number.isFinite(navRatioClamped)) {
+        const deviation = Math.abs(navRatioClamped - 1);
+        if (deviation >= ETA_CALIBRATION_RATIO_DEVIATION_HARD) {
+            ratioTrustWeight = 0.25;
+        } else if (deviation > ETA_CALIBRATION_RATIO_DEVIATION_SOFT) {
+            ratioTrustWeight =
+                1 -
+                0.75 *
+                    smoothstep01(
+                        (deviation - ETA_CALIBRATION_RATIO_DEVIATION_SOFT) /
+                            (ETA_CALIBRATION_RATIO_DEVIATION_HARD -
+                                ETA_CALIBRATION_RATIO_DEVIATION_SOFT),
+                    );
+        }
+    }
+
+    let blendWeight = distanceWeight * ageWeight * ratioTrustWeight;
+    if (isPaused && remainingKm > 1) {
+        blendWeight *= 0.5;
+    }
+
+    return Math.max(0, Math.min(1, blendWeight));
+}
+
+function smoothLerp(start, end, ratio) {
+    return start + (end - start) * smoothstep01(ratio);
+}
+
+function getLiveEtaDistanceWeight(remainingKm) {
+    if (!Number.isFinite(remainingKm)) return 0;
+    if (remainingKm >= LIVE_WEIGHT_FAR_KM) return 0;
+
+    if (remainingKm >= LIVE_WEIGHT_MID_KM) {
+        const t = (LIVE_WEIGHT_FAR_KM - remainingKm) / (LIVE_WEIGHT_FAR_KM - LIVE_WEIGHT_MID_KM);
+        return smoothLerp(0, LIVE_WEIGHT_DIST_AT_MID, t);
+    }
+    if (remainingKm >= LIVE_WEIGHT_NEAR_KM) {
+        const t = (LIVE_WEIGHT_MID_KM - remainingKm) / (LIVE_WEIGHT_MID_KM - LIVE_WEIGHT_NEAR_KM);
+        return smoothLerp(LIVE_WEIGHT_DIST_AT_MID, LIVE_WEIGHT_DIST_AT_NEAR, t);
+    }
+    if (remainingKm >= LIVE_WEIGHT_FULL_KM) {
+        const t =
+            (LIVE_WEIGHT_NEAR_KM - remainingKm) / (LIVE_WEIGHT_NEAR_KM - LIVE_WEIGHT_FULL_KM);
+        return smoothLerp(LIVE_WEIGHT_DIST_AT_NEAR, LIVE_WEIGHT_DIST_AT_FULL, t);
+    }
+
+    const t = (LIVE_WEIGHT_FULL_KM - Math.max(0, remainingKm)) / LIVE_WEIGHT_FULL_KM;
+    return smoothLerp(LIVE_WEIGHT_DIST_AT_FULL, LIVE_WEIGHT_DIST_AT_FINAL, t);
+}
+
+function getLiveEtaSpeedReliabilityWeight(effectiveSpeedKmh, remainingKm) {
+    if (!Number.isFinite(effectiveSpeedKmh) || effectiveSpeedKmh <= 0) return 0;
+    if (remainingKm > LIVE_WEIGHT_NEAR_KM) {
+        if (effectiveSpeedKmh < LIVE_SPEED_RELIABILITY_LOW_KMH) return 0.05;
+        if (effectiveSpeedKmh < LIVE_SPEED_RELIABILITY_MID_KMH) return 0.2;
+        if (effectiveSpeedKmh < LIVE_SPEED_RELIABILITY_HIGH_KMH) return 0.45;
+    }
+    if (effectiveSpeedKmh < ARRIVAL_SPEED_MAX_KMH) return 0.2;
+    return 1;
+}
+
+function getLiveEtaVolatilityWeight(speedDeltaEmaKmh) {
+    if (!Number.isFinite(speedDeltaEmaKmh)) return 1;
+    let weight = 1;
+    if (speedDeltaEmaKmh > 12) weight *= 0.8;
+    if (speedDeltaEmaKmh > 20) weight *= 0.7;
+    if (speedDeltaEmaKmh > 30) weight *= 0.6;
+    return weight;
+}
+
+function getLiveEtaWeight(remainingKm, speedDeltaEmaKmh, effectiveSpeedKmh) {
+    const distanceWeight = getLiveEtaDistanceWeight(remainingKm);
+    const speedReliabilityWeight = getLiveEtaSpeedReliabilityWeight(
+        effectiveSpeedKmh,
+        remainingKm,
+    );
+    const volatilityWeight = getLiveEtaVolatilityWeight(speedDeltaEmaKmh);
+    const combined = distanceWeight * speedReliabilityWeight * volatilityWeight;
+    return Math.max(0, Math.min(LIVE_WEIGHT_MAX, combined));
+}
+
+function clampSpeedBasedEtaMinutes(speedBasedRealMin, routeModelCalibratedMin, remainingKm) {
+    if (!Number.isFinite(speedBasedRealMin) || speedBasedRealMin <= 0) {
+        return Math.max(1, Number(routeModelCalibratedMin) || 1);
+    }
+    const model = Number(routeModelCalibratedMin);
+    if (!Number.isFinite(model) || model <= 0) {
+        return speedBasedRealMin;
+    }
+
+    let maxRatio = SPEED_BASED_MAX_RATIO_FINAL;
+    if (remainingKm > LIVE_WEIGHT_FAR_KM) {
+        maxRatio = SPEED_BASED_MAX_RATIO_FAR;
+    } else if (remainingKm > LIVE_WEIGHT_NEAR_KM) {
+        maxRatio = SPEED_BASED_MAX_RATIO_MID;
+    } else if (remainingKm > 10) {
+        maxRatio = SPEED_BASED_MAX_RATIO_NEAR;
+    }
+
+    const minEta = model * SPEED_BASED_MIN_RATIO;
+    const maxEta = model * maxRatio;
+    return Math.max(minEta, Math.min(maxEta, speedBasedRealMin));
+}
+
+function clamp01(value) {
+    return Math.max(0, Math.min(1, Number(value) || 0));
+}
+
+function smoothstep01(value) {
+    const t = clamp01(value);
+    return t * t * (3 - 2 * t);
+}
+
+function getDestinationNearWeight(remainingKm) {
+    if (!Number.isFinite(remainingKm)) return 0;
+    if (remainingKm >= ETA_NEAR_BLEND_START_KM) return 0;
+    if (remainingKm <= ETA_NEAR_BLEND_FULL_KM) return 1;
+
+    const range = ETA_NEAR_BLEND_START_KM - ETA_NEAR_BLEND_FULL_KM;
+    if (range <= 0) return 0;
+    const ratio = (ETA_NEAR_BLEND_START_KM - remainingKm) / range;
+    return smoothstep01(ratio);
+}
+
+function smoothEtaMinutes(rawEtaMinutes, context = {}) {
+    const now = Date.now();
+    const sanitizedRaw = Math.max(1, Number(rawEtaMinutes) || 0);
+    if (routeEngine.etaSmoothedMinutes <= 0 || !routeEngine.etaUpdatedAtMs) {
+        routeEngine.etaSmoothedMinutes = sanitizedRaw;
+        routeEngine.etaUpdatedAtMs = now;
+        return sanitizedRaw;
+    }
+
+    const elapsedMs = Math.max(0, now - routeEngine.etaUpdatedAtMs);
+    const elapsedSec = Math.max(0.1, elapsedMs / 1000);
+    const elapsedMin = elapsedSec / 60;
+    const projectionRate = Math.max(0, Math.min(1, Number(context.projectionRate) || 0));
+    const projected = Math.max(0, routeEngine.etaSmoothedMinutes - elapsedMin * projectionRate);
+    const maxUp = ETA_JUMP_GUARD_UP_BASE_MIN + ETA_JUMP_GUARD_UP_RATE_MIN_PER_SEC * elapsedSec;
+    const maxDown =
+        ETA_JUMP_GUARD_DOWN_BASE_MIN + ETA_JUMP_GUARD_DOWN_RATE_MIN_PER_SEC * elapsedSec;
+
+    let guardedRaw = sanitizedRaw;
+    const delta = guardedRaw - projected;
+    if (delta > maxUp) guardedRaw = projected + maxUp;
+    if (delta < -maxDown) guardedRaw = projected - maxDown;
+
+    const remainingKm = Number(context.remainingKm);
+    const nearBlendWeight = Number.isFinite(remainingKm)
+        ? smoothstep01(
+              (ETA_NEAR_BLEND_START_KM -
+                  Math.max(0, Math.min(ETA_NEAR_BLEND_START_KM, remainingKm))) /
+                  ETA_NEAR_BLEND_START_KM,
+          )
+        : 0;
+    const alpha = Math.max(
+        0.12,
+        Math.min(0.5, ETA_SMOOTH_ALPHA_BASE + nearBlendWeight * ETA_SMOOTH_ALPHA_NEAR_BOOST),
+    );
+    const smoothed = projected * (1 - alpha) + guardedRaw * alpha;
 
     routeEngine.etaSmoothedMinutes = smoothed;
     routeEngine.etaUpdatedAtMs = now;
@@ -985,6 +1451,7 @@ function buildJobKey(job) {
 }
 
 async function buildRouteForJob(truck, job) {
+    const buildStartMs = Date.now();
     const ready = await initializeRouteEngine();
     if (!ready) return null;
 
@@ -1029,7 +1496,13 @@ async function buildRouteForJob(truck, job) {
         if (best && best.path.length < 1500) break;
     }
 
-    if (!best) return null;
+    if (!best) {
+        routeLog("route_build_no_result", {
+            attempts: attemptCount,
+            buildMs: Date.now() - buildStartMs,
+        });
+        return null;
+    }
     const stats = buildRouteStats(best.path);
     routeLog("route_build_success", {
         attempts: attemptCount,
@@ -1037,6 +1510,7 @@ async function buildRouteForJob(truck, job) {
         gameMinutes: Number(stats.totalGameMin.toFixed(2)),
         realMinutes: Number(stats.totalRealMin.toFixed(2)),
         gameKm: Number(stats.totalGameKm.toFixed(2)),
+        buildMs: Date.now() - buildStartMs,
     });
 
     return {
@@ -1058,6 +1532,8 @@ async function ensureRouteCache(truck, job, options = {}) {
         routeEngine.routeCache = null;
         routeEngine.etaSmoothedMinutes = 0;
         routeEngine.etaUpdatedAtMs = 0;
+        routeEngine.waitPenaltyMinutes = 0;
+        routeEngine.waitPenaltyUpdatedAtMs = 0;
         routeEngine.etaBootstrapSinceMs = 0;
         return;
     }
@@ -1097,13 +1573,18 @@ async function ensureRouteCache(truck, job, options = {}) {
     routeEngine.lastRouteTryAt = now;
     routeEngine.routeInFlight = true;
     routeLog("cache_rebuild_start", { key, force, routeExpired });
+    const rebuildStartMs = Date.now();
     try {
         const route = await buildRouteForJob(truck, job);
         if (route) {
             routeEngine.routeCache = route;
             routeEngine.lastPathIndex = 0;
-            routeEngine.etaSmoothedMinutes = 0;
-            routeEngine.etaUpdatedAtMs = 0;
+            if (!hasValid) {
+                routeEngine.etaSmoothedMinutes = 0;
+                routeEngine.etaUpdatedAtMs = 0;
+                routeEngine.waitPenaltyMinutes = 0;
+                routeEngine.waitPenaltyUpdatedAtMs = 0;
+            }
             routeEngine.etaBootstrapSinceMs = 0;
             console.log(
                 `[RouteEngine] Route built. nodes=${route.pathNodeIds.length}, game=${route.totalGameMin.toFixed(
@@ -1116,15 +1597,20 @@ async function ensureRouteCache(truck, job, options = {}) {
                 key,
                 pathNodes: route.pathNodeIds.length,
                 realMinutes: Number(route.totalRealMin.toFixed(2)),
+                rebuildMs: Date.now() - rebuildStartMs,
             });
         } else {
             console.warn("[RouteEngine] Route build returned null");
-            routeLog("cache_rebuild_null", { key });
+            routeLog("cache_rebuild_null", {
+                key,
+                rebuildMs: Date.now() - rebuildStartMs,
+            });
         }
     } catch (error) {
         console.error("[RouteEngine] Route build failed:", error);
         routeLog("cache_rebuild_failed", {
             key,
+            rebuildMs: Date.now() - rebuildStartMs,
             message: error?.message || String(error),
         });
     } finally {
@@ -1133,6 +1619,7 @@ async function ensureRouteCache(truck, job, options = {}) {
 }
 
 function estimateRealEtaFromRoute(truck, navigation, game) {
+    const calcStartMs = Date.now();
     const cache = routeEngine.routeCache;
     if (!cache || !truck?.placement) return null;
 
@@ -1148,39 +1635,104 @@ function estimateRealEtaFromRoute(truck, navigation, game) {
     const idx = progress.segmentIndex;
     const remGame = Math.max(0, cache.totalGameMin - cache.cumulativeGameMin[idx]);
     const remKm = Math.max(0, cache.totalGameKm - cache.cumulativeGameKm[idx]);
-    let routeModelReal = Math.max(0, cache.totalRealMin - cache.cumulativeRealMin[idx]);
+    const routeAgeMs = Math.max(0, Date.now() - Number(cache.createdAt || 0));
+    const routeModelPure = Math.max(0, cache.totalRealMin - cache.cumulativeRealMin[idx]);
+    let routeModelCalibrated = routeModelPure;
+    let navRatioClamped = 1;
 
     const navGame = parseGameMinutes(navigation?.estimatedTime);
     if (navGame > 1 && remGame > 1) {
         const ratio = navGame / remGame;
-        const clamped = Math.max(0.5, Math.min(1.8, ratio));
-        routeModelReal *= clamped;
+        navRatioClamped = Math.max(0.5, Math.min(1.8, ratio));
+        routeModelCalibrated *= navRatioClamped;
     }
 
+    const truckSpeedKmh = Math.max(0, Number(truck?.speed || 0));
     const liveSpeed = Math.max(0, updateEffectiveSpeedKmh(truck, navigation, game) || 0);
     const speedForEta = Math.max(ETA_MIN_EFFECTIVE_SPEED_KMH, liveSpeed);
-    const speedBasedRealMin = speedForEta > 0 ? (remKm / speedForEta) * 60 : routeModelReal;
-    const liveWeight = getLiveEtaWeight(
+    const speedBasedRealMin = speedForEta > 0 ? (remKm / speedForEta) * 60 : routeModelCalibrated;
+    const speedBasedCappedMin = clampSpeedBasedEtaMinutes(
+        speedBasedRealMin,
+        routeModelCalibrated,
         remKm,
-        routeEngine.speedDeltaEmaKmh,
-        liveSpeed,
     );
-    let remReal =
+    const liveDistanceWeight = getLiveEtaDistanceWeight(remKm);
+    const liveSpeedReliabilityWeight = getLiveEtaSpeedReliabilityWeight(liveSpeed, remKm);
+    const liveVolatilityWeight = getLiveEtaVolatilityWeight(routeEngine.speedDeltaEmaKmh);
+    const baseLiveWeight = getLiveEtaWeight(remKm, routeEngine.speedDeltaEmaKmh, liveSpeed);
+    const liveWeight =
+        game?.paused || (truckSpeedKmh <= ETA_PROJECTION_STOP_SPEED_KMH && remKm > 1)
+            ? 0
+            : baseLiveWeight;
+    const etaProjectionRate = getEtaProjectionRate({
+        remainingKm: remKm,
+        truckSpeedKmh,
+        effectiveSpeedKmh: liveSpeed,
+        isPaused: !!game?.paused,
+    });
+    const waitPenaltyMinutes = updateEtaWaitPenalty({
+        remainingKm: remKm,
+        truckSpeedKmh,
+        effectiveSpeedKmh: liveSpeed,
+        isPaused: !!game?.paused,
+    });
+    const pureBlendedRaw =
         liveWeight > 0
-            ? routeModelReal * (1 - liveWeight) + speedBasedRealMin * liveWeight
-            : routeModelReal;
+            ? routeModelPure * (1 - liveWeight) + speedBasedCappedMin * liveWeight
+            : routeModelPure;
+    const calibratedBlendedRaw =
+        liveWeight > 0
+            ? routeModelCalibrated * (1 - liveWeight) + speedBasedCappedMin * liveWeight
+            : routeModelCalibrated;
+    const pureCandidateMinutes = pureBlendedRaw + waitPenaltyMinutes;
+    const calibratedCandidateMinutes = calibratedBlendedRaw + waitPenaltyMinutes;
+    const calibrationBlendWeight = getEtaCalibrationBlendWeight({
+        remainingKm: remKm,
+        routeAgeMs,
+        navRatioClamped,
+        isPaused: !!game?.paused,
+    });
+    const hybridCandidateMinutes =
+        pureCandidateMinutes * (1 - calibrationBlendWeight) +
+        calibratedCandidateMinutes * calibrationBlendWeight;
+
+    let remReal = hybridCandidateMinutes;
     remReal = Math.max(1, remReal);
-    remReal = smoothEtaMinutes(remReal);
+    remReal = smoothEtaMinutes(remReal, {
+        remainingKm: remKm,
+        projectionRate: etaProjectionRate,
+    });
 
     return {
         realMinutes: remReal,
         remainingKm: remKm,
         offRouteKm: progress.distKm,
         segmentIndex: progress.segmentIndex,
-        routeModelRealMinutes: routeModelReal,
+        routeModelPureMinutes: routeModelPure,
+        routeModelCalibratedMinutes: routeModelCalibrated,
+        routeModelRealMinutes: hybridCandidateMinutes,
+        routeModelHybridMinutes: hybridCandidateMinutes,
         speedBasedRealMinutes: speedBasedRealMin,
+        speedBasedCappedMinutes: speedBasedCappedMin,
         liveWeight,
+        liveDistanceWeight,
+        liveSpeedReliabilityWeight,
+        liveVolatilityWeight,
         liveSpeedKmh: liveSpeed,
+        truckSpeedKmh,
+        etaProjectionRate,
+        waitPenaltyMinutes,
+        routeAgeMs,
+        navRatioClamped,
+        calibrationBlendWeight,
+        pureCandidateMinutes,
+        calibratedCandidateMinutes,
+        hybridCandidateMinutes,
+        pureBlendedRawMinutes: pureBlendedRaw,
+        calibratedBlendedRawMinutes: calibratedBlendedRaw,
+        navGameMinutes: navGame,
+        remGameMinutes: remGame,
+        calcMs: Date.now() - calcStartMs,
     };
 }
 
@@ -1364,6 +1916,7 @@ const elFuelConsumption = document.getElementById("fuel-consumption");
 const elNavDistance = document.getElementById("nav-distance");
 const elNavEta = document.getElementById("nav-eta");
 const elRealClock = document.getElementById("real-clock");
+const elEtaEvalStatus = document.getElementById("eta-eval-status");
 
 function formatGear(gear) {
     if (gear > 0) return `D${gear}`;
@@ -1379,24 +1932,174 @@ function updateRealClock() {
     h = h % 12 || 12;
     const m = String(now.getMinutes()).padStart(2, "0");
     elRealClock.innerText = `${ampm} ${h}:${m}`;
+    refreshEtaEvalStatusIndicator();
+}
+
+function refreshEtaEvalStatusIndicator() {
+    if (!elEtaEvalStatus) return;
+
+    if (etaEvalUiState.lastError) {
+        elEtaEvalStatus.className = "eta-eval-pill off";
+        elEtaEvalStatus.innerText = "분석 기록 오류";
+        return;
+    }
+
+    if (!etaEvalUiState.available) {
+        elEtaEvalStatus.className = "eta-eval-pill off";
+        elEtaEvalStatus.innerText = "분석 기록 비활성";
+        return;
+    }
+
+    if (!etaEvalUiState.lastTickSentAtMs) {
+        elEtaEvalStatus.className = "eta-eval-pill wait";
+        elEtaEvalStatus.innerText = "분석 기록 준비";
+        return;
+    }
+
+    const ageMs = Date.now() - etaEvalUiState.lastTickSentAtMs;
+    if (ageMs <= 2_500) {
+        elEtaEvalStatus.className = "eta-eval-pill on";
+        const shortSession = etaEvalUiState.sessionId
+            ? etaEvalUiState.sessionId.slice(-6)
+            : "active";
+        elEtaEvalStatus.innerText = `분석 기록중 (${shortSession})`;
+        return;
+    }
+
+    elEtaEvalStatus.className = "eta-eval-pill wait";
+    elEtaEvalStatus.innerText = "분석 기록 대기";
+}
+
+async function initializeEtaEvalStatusIndicator() {
+    if (!elEtaEvalStatus) return;
+    if (!window?.electronAPI?.getEtaEvalSession) {
+        refreshEtaEvalStatusIndicator();
+        return;
+    }
+
+    try {
+        const session = await window.electronAPI.getEtaEvalSession();
+        if (session?.session_id) {
+            etaEvalUiState.available = true;
+            etaEvalUiState.sessionId = String(session.session_id);
+        } else {
+            etaEvalUiState.available = false;
+            etaEvalUiState.lastError = "session_id 없음";
+        }
+    } catch (error) {
+        etaEvalUiState.available = false;
+        etaEvalUiState.lastError = error?.message || String(error);
+    }
+    refreshEtaEvalStatusIndicator();
 }
 
 setInterval(updateRealClock, 1000);
 updateRealClock();
+initializeEtaEvalStatusIndicator();
+
+function startEtaEvalTrip(jobKey) {
+    const now = Date.now();
+    const resume = getEtaEvalJourneyResume(jobKey);
+    etaEvalTripState.activeTripId = createEtaEvalId("trip");
+    etaEvalTripState.activeJourneyId = resume?.journey_id || createEtaEvalId("journey");
+    etaEvalTripState.activeJourneySegmentIndex = Math.max(
+        1,
+        Number(resume?.next_segment_index || 1),
+    );
+    etaEvalTripState.resumedFromTripId = String(resume?.last_trip_id || "");
+    etaEvalTripState.activeJobKey = jobKey;
+    etaEvalTripState.startedAtMs = now;
+    etaEvalTripState.rerouteCount = 0;
+    etaEvalTripState.maxOffRouteKm = 0;
+    etaEvalTripState.speedSum = 0;
+    etaEvalTripState.speedSamples = 0;
+    writeEtaEvalJourneyState({
+        journey_id: etaEvalTripState.activeJourneyId,
+        job_key: jobKey,
+        next_segment_index: etaEvalTripState.activeJourneySegmentIndex,
+        last_trip_id: etaEvalTripState.activeTripId,
+        pending_since_ms: now,
+        end_reason: "active",
+    });
+    emitEtaEvalEvent("trip_start", {
+        trip_id: etaEvalTripState.activeTripId,
+        journey_id: etaEvalTripState.activeJourneyId,
+        journey_segment_index: etaEvalTripState.activeJourneySegmentIndex,
+        resumed_from_trip_id: etaEvalTripState.resumedFromTripId,
+        job_key: jobKey,
+        started_at_ms: now,
+    });
+}
 
 async function fetchTelemetry() {
+    const cycleStartMs = Date.now();
+    let telemetryFetchMs = 0;
+    let cacheEnsureMs = 0;
+    let etaCalcMs = 0;
+    let distKm = 0;
+    let truckSpeedKmh = 0;
+    let routeAgeMs = 0;
+    let routeEta = null;
+    let hasJob = false;
+    let jobKey = "";
+    let navGameMin = 0;
+    let scale = 19;
+    let etaRealMinutes = 0;
+    let etaAStarPure = 0;
+    let etaAStarCalibrated = 0;
+    let etaApiBase = 0;
+    let etaApiNearInterp = 0;
+    let etaDisplayedLegacy = 0;
+    let etaDisplayedHybrid = 0;
+    let remainingKmForCandidates = 0;
+    let nearInterpWeight = 0;
+    let navFallbackUsed = false;
     try {
+        const fetchStartMs = Date.now();
         const response = await fetch(TELEMETRY_URL);
         if (!response.ok) return;
         const data = await response.json();
+        telemetryFetchMs = Date.now() - fetchStartMs;
         const { game, truck, trailer, job, navigation } = data;
-        const hasJob = !!job?.destinationCity;
+        hasJob = !!job?.destinationCity;
+        jobKey = hasJob ? buildJobKey(job) : "";
+        truckSpeedKmh = Math.max(0, Number(truck?.speed || 0));
 
         if (!game.connected) {
+            if (etaEvalTripState.activeTripId) {
+                finalizeEtaEvalTrip("disconnect", Date.now());
+            }
+            routeEngine.waitPenaltyMinutes = 0;
+            routeEngine.waitPenaltyUpdatedAtMs = 0;
             elNavDistance.innerText = "미연결";
             elNavEta.innerText = "-";
             logEtaMode("disconnected");
+            emitEtaEvalTick({
+                type: "telemetry_tick",
+                game_connected: false,
+                game_paused: !!game?.paused,
+                has_job: hasJob,
+                eta_mode: routeEngine.lastEtaMode || "disconnected",
+                truck_speed_kmh: safeNumber(truckSpeedKmh, 3),
+                total_cycle_ms: Date.now() - cycleStartMs,
+                fetch_ms: telemetryFetchMs,
+                cache_ms: cacheEnsureMs,
+                eta_ms: etaCalcMs,
+                has_route_cache: !!routeEngine.routeCache,
+                route_inflight: !!routeEngine.routeInFlight,
+            });
             return;
+        }
+
+        if (hasJob) {
+            if (!etaEvalTripState.activeTripId) {
+                startEtaEvalTrip(jobKey);
+            } else if (etaEvalTripState.activeJobKey !== jobKey) {
+                finalizeEtaEvalTrip("job_changed", Date.now());
+                startEtaEvalTrip(jobKey);
+            }
+        } else if (etaEvalTripState.activeTripId) {
+            finalizeEtaEvalTrip("job_cleared", Date.now());
         }
 
         const maxTruckWear = Math.max(
@@ -1434,23 +2137,31 @@ async function fetchTelemetry() {
             routeEngine.routeCache = null;
             routeEngine.etaSmoothedMinutes = 0;
             routeEngine.etaUpdatedAtMs = 0;
+            routeEngine.waitPenaltyMinutes = 0;
+            routeEngine.waitPenaltyUpdatedAtMs = 0;
             routeEngine.arrivalSinceMs = 0;
+            routeEngine.arrivalEventSent = false;
             routeEngine.etaBootstrapSinceMs = 0;
         }
 
         elFuelConsumption.innerText = `${(truck.fuelAverageConsumption * 100).toFixed(1)} l/100km`;
         updateEffectiveSpeedKmh(truck, navigation, game);
 
-        const distKm = Math.round((navigation?.estimatedDistance || 0) / 1000);
+        distKm = Math.round((navigation?.estimatedDistance || 0) / 1000);
         elNavDistance.innerText = `${distKm} km`;
+        navGameMin = parseGameMinutes(navigation?.estimatedTime);
+        scale = Math.max(1, Number(game.timeScale || 19));
 
+        const cacheStartMs = Date.now();
         await ensureRouteCache(truck, job);
+        cacheEnsureMs = Date.now() - cacheStartMs;
 
-        const routeEta = estimateRealEtaFromRoute(truck, navigation, game);
-        const routeAgeMs = routeEngine.routeCache
+        const etaStartMs = Date.now();
+        routeEta = estimateRealEtaFromRoute(truck, navigation, game);
+        etaCalcMs = Date.now() - etaStartMs;
+        routeAgeMs = routeEngine.routeCache
             ? Date.now() - routeEngine.routeCache.createdAt
             : 0;
-        const truckSpeedKmh = Math.max(0, Number(truck.speed || 0));
         if (
             routeEta &&
             routeEta.offRouteKm >= ROUTE_OFFROUTE_RECALC_KM &&
@@ -1464,19 +2175,23 @@ async function fetchTelemetry() {
                 speedKmh: Number(truckSpeedKmh.toFixed(1)),
                 routeAgeMs,
             });
+            etaEvalTripState.rerouteCount += 1;
+            etaEvalTripState.maxOffRouteKm = Math.max(
+                etaEvalTripState.maxOffRouteKm,
+                Number(routeEta.offRouteKm || 0),
+            );
             await ensureRouteCache(truck, job, { force: true });
         }
 
-        let etaRealMinutes = routeEta?.realMinutes || 0;
+        etaRealMinutes = routeEta?.realMinutes || 0;
         if (!etaRealMinutes && hasJob) {
             const waitedMs = routeEngine.etaBootstrapSinceMs
                 ? Date.now() - routeEngine.etaBootstrapSinceMs
                 : 0;
             if (waitedMs >= ETA_BOOTSTRAP_WAIT_MS) {
-                const navGameMin = parseGameMinutes(navigation?.estimatedTime);
-                const scale = Math.max(1, Number(game.timeScale || 19));
                 if (navGameMin > 0) etaRealMinutes = navGameMin / scale;
                 if (etaRealMinutes > 0) {
+                    navFallbackUsed = true;
                     logEtaMode("nav_fallback", {
                         navGameMin: Number(navGameMin.toFixed(2)),
                         scale: Number(scale.toFixed(2)),
@@ -1495,9 +2210,18 @@ async function fetchTelemetry() {
         );
 
         if (arrived) {
+            if (!routeEngine.arrivalEventSent) {
+                routeEngine.arrivalEventSent = true;
+                emitEtaEvalEvent("arrival_detected", {
+                    dist_km: safeNumber(distKm, 3),
+                    speed_kmh: safeNumber(truckSpeedKmh, 3),
+                    rem_km: safeNumber(routeEta?.remainingKm ?? distKm, 3),
+                });
+            }
             elNavEta.innerText = "도착";
             logEtaMode("arrived", { distKm, speed: Number((truck.speed || 0).toFixed(1)) });
         } else if (etaRealMinutes && distKm > 0) {
+            routeEngine.arrivalEventSent = false;
             const etaText = formatEtaText(etaRealMinutes);
             const arrival = new Date(Date.now() + etaRealMinutes * 60000);
             let h = arrival.getHours();
@@ -1513,8 +2237,16 @@ async function fetchTelemetry() {
                     speedEma: Number((routeEngine.speedEmaKmh || 0).toFixed(1)),
                     mode: "route_model",
                     routeModelMin: Number((routeEta.routeModelRealMinutes || 0).toFixed(2)),
+                    routeModelPureMin: Number((routeEta.routeModelPureMinutes || 0).toFixed(2)),
+                    routeModelCalibratedMin: Number(
+                        (routeEta.routeModelCalibratedMinutes || 0).toFixed(2),
+                    ),
                     speedBasedMin: Number((routeEta.speedBasedRealMinutes || 0).toFixed(2)),
+                    speedBasedCappedMin: Number((routeEta.speedBasedCappedMinutes || 0).toFixed(2)),
                     liveWeight: Number((routeEta.liveWeight || 0).toFixed(2)),
+                    projectionRate: Number((routeEta.etaProjectionRate || 0).toFixed(2)),
+                    waitPenaltyMin: Number((routeEta.waitPenaltyMinutes || 0).toFixed(2)),
+                    calibrationBlendWeight: Number((routeEta.calibrationBlendWeight || 0).toFixed(2)),
                 });
             } else {
                 logEtaMode("nav_fallback", {
@@ -1524,6 +2256,7 @@ async function fetchTelemetry() {
                 });
             }
         } else if (hasJob) {
+            routeEngine.arrivalEventSent = false;
             elNavEta.innerText = "계산 중...";
             logEtaMode("calculating", {
                 distKm,
@@ -1531,18 +2264,160 @@ async function fetchTelemetry() {
                 routeInFlight: routeEngine.routeInFlight,
             });
         } else {
+            routeEngine.arrivalEventSent = false;
             elNavEta.innerText = "-";
             logEtaMode("idle");
         }
+
+        remainingKmForCandidates = Math.max(0, routeEta?.remainingKm ?? distKm ?? 0);
+        etaAStarCalibrated = Math.max(0, routeEta?.calibratedCandidateMinutes || 0);
+        etaAStarPure = Math.max(0, routeEta?.pureCandidateMinutes || 0);
+        etaDisplayedLegacy = Math.max(0, routeEta?.calibratedCandidateMinutes || 0);
+        etaDisplayedHybrid = Math.max(0, routeEta?.hybridCandidateMinutes || 0);
+        etaApiBase = navGameMin > 0 ? navGameMin / scale : 0;
+        const liveSpeedForApi = Math.max(
+            ETA_MIN_EFFECTIVE_SPEED_KMH,
+            Number(routeEta?.liveSpeedKmh || routeEngine.speedEmaKmh || truckSpeedKmh || 0),
+        );
+        const apiSpeedBasedMin =
+            remainingKmForCandidates > 0
+                ? (remainingKmForCandidates / liveSpeedForApi) * 60
+                : etaApiBase;
+        nearInterpWeight = getDestinationNearWeight(remainingKmForCandidates);
+        etaApiNearInterp =
+            etaApiBase > 0
+                ? etaApiBase * (1 - nearInterpWeight) + apiSpeedBasedMin * nearInterpWeight
+                : 0;
+
+        if (etaEvalTripState.activeTripId && Number.isFinite(truckSpeedKmh)) {
+            etaEvalTripState.speedSum += truckSpeedKmh;
+            etaEvalTripState.speedSamples += 1;
+            if (routeEta?.offRouteKm) {
+                etaEvalTripState.maxOffRouteKm = Math.max(
+                    etaEvalTripState.maxOffRouteKm,
+                    Number(routeEta.offRouteKm),
+                );
+            }
+        }
+
+        routeLogThrottled(
+            "benchmark_eta_cycle",
+            "benchmark_eta_cycle",
+            {
+                fetchMs: telemetryFetchMs,
+                cacheMs: cacheEnsureMs,
+                etaMs: etaCalcMs,
+                totalMs: Date.now() - cycleStartMs,
+                hasJob,
+                hasRoute: !!routeEngine.routeCache,
+                etaMode: routeEngine.lastEtaMode || "unknown",
+                distKm,
+                speedKmh: Number((truck.speed || 0).toFixed(1)),
+            },
+            BENCHMARK_LOG_INTERVAL_MS,
+        );
+
+        emitEtaEvalTick({
+            type: "telemetry_tick",
+            game_connected: true,
+            game_paused: !!game?.paused,
+            has_job: hasJob,
+            eta_mode: routeEngine.lastEtaMode || "unknown",
+            truck_speed_kmh: safeNumber(truckSpeedKmh, 3),
+            speed_ema_kmh: safeNumber(routeEngine.speedEmaKmh, 3),
+            speed_delta_ema_kmh: safeNumber(routeEngine.speedDeltaEmaKmh, 3),
+            nav_distance_km: safeNumber(distKm, 3),
+            nav_estimated_time_game_min: safeNumber(navGameMin, 3),
+            game_time_scale: safeNumber(scale, 3),
+            remaining_km: safeNumber(remainingKmForCandidates, 3),
+            offroute_km: safeNumber(routeEta?.offRouteKm, 3),
+            segment_index: routeEta?.segmentIndex ?? routeEngine.lastPathIndex ?? null,
+            has_route_cache: !!routeEngine.routeCache,
+            route_inflight: !!routeEngine.routeInFlight,
+            route_age_ms: routeAgeMs,
+            route_model_pure_min: safeNumber(routeEta?.routeModelPureMinutes, 3),
+            route_model_calibrated_min: safeNumber(routeEta?.routeModelCalibratedMinutes, 3),
+            route_model_min: safeNumber(routeEta?.routeModelRealMinutes, 3),
+            route_model_hybrid_min: safeNumber(routeEta?.routeModelHybridMinutes, 3),
+            speed_based_min: safeNumber(routeEta?.speedBasedRealMinutes, 3),
+            speed_based_capped_min: safeNumber(routeEta?.speedBasedCappedMinutes, 3),
+            live_weight: safeNumber(routeEta?.liveWeight, 4),
+            live_weight_distance: safeNumber(routeEta?.liveDistanceWeight, 4),
+            live_weight_speed: safeNumber(routeEta?.liveSpeedReliabilityWeight, 4),
+            live_weight_volatility: safeNumber(routeEta?.liveVolatilityWeight, 4),
+            eta_projection_rate: safeNumber(routeEta?.etaProjectionRate, 4),
+            wait_penalty_min: safeNumber(routeEta?.waitPenaltyMinutes, 4),
+            nav_ratio_clamped: safeNumber(routeEta?.navRatioClamped, 4),
+            calibration_blend_weight: safeNumber(routeEta?.calibrationBlendWeight, 4),
+            eta_a_star_pure_min: safeNumber(etaAStarPure, 3),
+            eta_a_star_calibrated_min: safeNumber(etaAStarCalibrated, 3),
+            eta_api_base_min: safeNumber(etaApiBase, 3),
+            eta_api_near_interp_min: safeNumber(etaApiNearInterp, 3),
+            eta_displayed_legacy_min: safeNumber(etaDisplayedLegacy, 3),
+            eta_displayed_hybrid_min: safeNumber(etaDisplayedHybrid, 3),
+            eta_displayed_min: safeNumber(etaRealMinutes, 3),
+            api_near_weight: safeNumber(nearInterpWeight, 4),
+            nav_fallback_used: navFallbackUsed,
+            fetch_ms: telemetryFetchMs,
+            cache_ms: cacheEnsureMs,
+            eta_ms: etaCalcMs,
+            total_cycle_ms: Date.now() - cycleStartMs,
+        });
     } catch (error) {
         console.error("Telemetry error:", error);
         elNavEta.innerText = `오류: ${error.message}`;
         routeLog("telemetry_error", { message: error?.message || String(error) });
+        emitEtaEvalEvent(
+            "telemetry_error",
+            {
+                message: error?.message || String(error),
+            },
+            "error",
+        );
+        routeLogThrottled(
+            "benchmark_eta_cycle_error",
+            "benchmark_eta_cycle_error",
+            {
+                fetchMs: telemetryFetchMs,
+                cacheMs: cacheEnsureMs,
+                etaMs: etaCalcMs,
+                totalMs: Date.now() - cycleStartMs,
+                message: error?.message || String(error),
+            },
+            BENCHMARK_LOG_INTERVAL_MS,
+        );
+        emitEtaEvalTick({
+            type: "telemetry_tick_error",
+            game_connected: null,
+            has_job: hasJob,
+            eta_mode: routeEngine.lastEtaMode || "error",
+            truck_speed_kmh: safeNumber(truckSpeedKmh, 3),
+            nav_distance_km: safeNumber(distKm, 3),
+            nav_estimated_time_game_min: safeNumber(navGameMin, 3),
+            game_time_scale: safeNumber(scale, 3),
+            remaining_km: safeNumber(remainingKmForCandidates, 3),
+            eta_a_star_pure_min: safeNumber(etaAStarPure, 3),
+            eta_a_star_calibrated_min: safeNumber(etaAStarCalibrated, 3),
+            eta_api_base_min: safeNumber(etaApiBase, 3),
+            eta_api_near_interp_min: safeNumber(etaApiNearInterp, 3),
+            eta_displayed_legacy_min: safeNumber(etaDisplayedLegacy, 3),
+            eta_displayed_hybrid_min: safeNumber(etaDisplayedHybrid, 3),
+            eta_displayed_min: safeNumber(etaRealMinutes, 3),
+            fetch_ms: telemetryFetchMs,
+            cache_ms: cacheEnsureMs,
+            eta_ms: etaCalcMs,
+            total_cycle_ms: Date.now() - cycleStartMs,
+            error_message: error?.message || String(error),
+        });
     }
 }
 
 initializeRouteEngine().catch((e) => {
     console.error("[RouteEngine] Warmup failed:", e);
+});
+
+window.addEventListener("beforeunload", () => {
+    finalizeEtaEvalTrip("overlay_closed", Date.now());
 });
 
 setInterval(fetchTelemetry, 500);
